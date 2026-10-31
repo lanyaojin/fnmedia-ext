@@ -54,6 +54,20 @@ DEFAULTS = {
     # 若以后在管理页保存过，则以保存的值为准。
     "hidden_catalog_categories": ["anime"],
     "hidden_chart_categories": ["anime"],
+    # 复刻新增：源健康阶梯停用总开关（默认开）。关闭时，停用窗内的源仍参与
+    # 搜索（仅排序降权），用于“健康数据异常时先恢复播放、再查原因”的回滚。
+    "source_health_tiered": True,
+    # 复刻新增：自由筛选预设（绝非固定“儿童模式”）。
+    # 结构：{预设名: {hidden_catalog_categories?, hidden_chart_categories?,
+    #                 junk_keywords?, enabled_sources?}}，键缺失表示激活时不动该项。
+    # 预设名由用户自定，代码不预置任何预设。
+    "filter_presets": {},
+    "active_filter_preset": None,
+    # 复刻新增：海量库自定义子库（GoFilm 两级分类思路：大库下再分子库）。
+    # 每项：{id, title, parent(movie|tv), keywords[体裁/类型关键字],
+    #        hidden?}。匹配只看条目的 type_name（CMS 子分类名，如 动作片/国产剧），
+    # 不看标题（标题含关键字会误分类），vod_class 因 _map_vod 未保留而不用。
+    "custom_catalog_libraries": [],
     # 是否把每个启用的 TVBox 加固源（csp_*Guard，如比特/糯米/花花）生成为一张
     # 独立“专区媒体库”卡片。默认关闭：加固源只作为播放时可切换的线路/搜索源，
     # 不在媒体库列表里产生空库。需要专区墙时可在管理页打开。
@@ -359,6 +373,133 @@ class Config:
     def reset_junk_keywords(self) -> list[str]:
         self.save({"junk_keywords": list(JUNK_KEYWORDS)})
         return list(JUNK_KEYWORDS)
+
+    # ---------------- 自由筛选预设（复刻新增） ----------------
+    _PRESET_CATS = {"movie", "tv", "anime", "variety"}
+
+    @classmethod
+    def _clean_preset(cls, data: dict) -> dict:
+        out = {}
+        if isinstance(data.get("hidden_catalog_categories"), list):
+            seen, clean = set(), []
+            for c in data["hidden_catalog_categories"]:
+                if c in cls._PRESET_CATS and c not in seen:
+                    seen.add(c); clean.append(c)
+            out["hidden_catalog_categories"] = clean
+        if isinstance(data.get("hidden_chart_categories"), list):
+            seen, clean = set(), []
+            for c in data["hidden_chart_categories"]:
+                if c in cls._PRESET_CATS and c not in seen:
+                    seen.add(c); clean.append(c)
+            out["hidden_chart_categories"] = clean
+        if "junk_keywords" in data:
+            out["junk_keywords"] = cls.normalize_keywords(data.get("junk_keywords"))
+        if isinstance(data.get("enabled_sources"), list):
+            out["enabled_sources"] = [str(x) for x in data["enabled_sources"]
+                                      if isinstance(x, str) and x]
+        return out
+
+    def save_filter_preset(self, name: str, data: dict) -> tuple[bool, str]:
+        name = (name or "").strip()
+        if not name or len(name) > 30 or "/" in name or "\\" in name:
+            return False, "预设名非法（1-30 字，不能含 /）"
+        clean = self._clean_preset(data or {})
+        with _LOCK:
+            cfg = self.get()
+            presets = dict(cfg.get("filter_presets") or {})
+            presets[name] = clean
+            cfg["filter_presets"] = presets
+            self._persist(cfg)
+        return True, "ok"
+
+    def delete_filter_preset(self, name: str) -> tuple[bool, str]:
+        name = (name or "").strip()
+        with _LOCK:
+            cfg = self.get()
+            presets = dict(cfg.get("filter_presets") or {})
+            if name not in presets:
+                return False, "预设不存在"
+            presets.pop(name, None)
+            cfg["filter_presets"] = presets
+            if cfg.get("active_filter_preset") == name:
+                cfg["active_filter_preset"] = None
+            self._persist(cfg)
+        return True, "ok"
+
+    def activate_filter_preset(self, name: str | None) -> tuple[bool, str]:
+        """激活预设：按预设内容改写当前隐藏分类/噪音词/源启用态，并记 active。
+
+        name 为 None/空 = 仅清除 active 标记，不改回任何设置（见文件头说明）。
+        源启用：预设含 enabled_sources 时按“列出即启用、未列出即停用”精确应用；
+        不含该键时源启用态不动。应用后搜索缓存由调用方（app 层）清除。
+        """
+        with _LOCK:
+            cfg = self.get()
+            if not name:
+                cfg["active_filter_preset"] = None
+                self._persist(cfg)
+                return True, "ok"
+            presets = cfg.get("filter_presets") or {}
+            preset = presets.get(name)
+            if not isinstance(preset, dict):
+                return False, "预设不存在"
+            for k in ("hidden_catalog_categories", "hidden_chart_categories",
+                      "junk_keywords"):
+                if k in preset:
+                    cfg[k] = preset[k]
+            if "enabled_sources" in preset:
+                on = set(preset["enabled_sources"])
+                for src in cfg.get("sources", []):
+                    src["enabled"] = src.get("id") in on
+            cfg["active_filter_preset"] = name
+            self._persist(cfg)
+        return True, "ok"
+
+    # ---------------- 海量库自定义子库（复刻新增） ----------------
+    @classmethod
+    def clean_custom_library(cls, data: dict) -> tuple[dict | None, str]:
+        import re as _re
+        if not isinstance(data, dict):
+            return None, "子库定义须为对象"
+        lid = str(data.get("id") or "").strip()
+        if not _re.match(r"^[a-z0-9_-]{1,32}$", lid):
+            return None, "子库 id 非法（仅小写字母/数字/_/-，1-32 字）"
+        title = str(data.get("title") or "").strip()[:20]
+        if not title:
+            return None, "子库标题不能为空"
+        parent = str(data.get("parent") or "").strip()
+        if parent not in ("movie", "tv"):
+            return None, "parent 只能是 movie 或 tv（子库只从海量电影/剧集切）"
+        kws = cls.normalize_keywords(data.get("keywords"))
+        if not kws or len(kws) > 10:
+            return None, "keywords 须为 1-10 个关键字"
+        return {"id": lid, "title": title, "parent": parent,
+                "keywords": kws, "hidden": bool(data.get("hidden", False))}, "ok"
+
+    def save_custom_library(self, data: dict) -> tuple[bool, str]:
+        clean, msg = self.clean_custom_library(data)
+        if clean is None:
+            return False, msg
+        with _LOCK:
+            cfg = self.get()
+            libs = [l for l in (cfg.get("custom_catalog_libraries") or [])
+                    if isinstance(l, dict) and l.get("id") != clean["id"]]
+            libs.append(clean)
+            cfg["custom_catalog_libraries"] = libs
+            self._persist(cfg)
+        return True, "ok"
+
+    def delete_custom_library(self, lid: str) -> tuple[bool, str]:
+        lid = (lid or "").strip()
+        with _LOCK:
+            cfg = self.get()
+            libs = [l for l in (cfg.get("custom_catalog_libraries") or [])
+                    if isinstance(l, dict)]
+            if not any(l.get("id") == lid for l in libs):
+                return False, "子库不存在"
+            cfg["custom_catalog_libraries"] = [l for l in libs if l.get("id") != lid]
+            self._persist(cfg)
+        return True, "ok"
 
     def is_junk(self, title: str, remarks: str = "") -> bool:
         if not self._cfg.get("filter_junk", True):
