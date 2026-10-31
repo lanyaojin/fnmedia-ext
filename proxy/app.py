@@ -249,9 +249,13 @@ def compute_lib_move(displayed_guids: list[str], library_order: list[str],
                      pinned: set, guid: str, direction: str):
     """计算管理页 ↑/↓ 一步：返回 (new_order, new_pinned, moved, msg)。
 
-    displayed_guids 是同组（hot/catalog/custom）卡片在 App 展示顺序中的
-    guid 序列；移动只在组内进行，跨置顶边界时被移动库的置顶态随之翻转，
-    保证移动后的展示顺序与用户点的方向一致。纯函数，不碰配置。"""
+    displayed_guids 是管理页所见的完整展示顺序（即 App 展示顺序：置顶组
+    在前、其余在后），不是某个类型组的子序列——这是关键：若只传组内
+    序列，sort 时已保存的组内顺序会被当成全局前缀，导致整组瞬移到最前。
+    移动规则：在完整展示顺序里把 guid 删掉、插到目标位（恰好一格）；
+    跨置顶边界时 guid 的置顶态翻转为邻居的置顶态，使排序后的展示顺序
+    与移动后的可见顺序完全一致。已保存顺序里不在展示中的残留 guid
+    （已删子库）追加在末尾保留，不影响展示。纯函数，不碰配置。"""
     if direction not in ("up", "down"):
         return list(library_order), set(pinned), False, "方向非法"
     if guid not in displayed_guids:
@@ -262,21 +266,17 @@ def compute_lib_move(displayed_guids: list[str], library_order: list[str],
         return list(library_order), set(pinned), False, \
             "已到顶" if direction == "up" else "已到底"
     neighbor = displayed_guids[target]
-    order = [g for g in library_order if g]
-    seen = set(order)
-    for g in displayed_guids:
-        if g not in seen:
-            order.append(g)
-            seen.add(g)
-    i, j = order.index(guid), order.index(neighbor)
-    order[i], order[j] = order[j], order[i]
+    new_display = list(displayed_guids)
+    del new_display[idx]
+    new_display.insert(target, guid)
     new_pinned = set(pinned)
-    if (guid in pinned) != (neighbor in pinned):
-        if guid in new_pinned:
-            new_pinned.discard(guid)
-        else:
-            new_pinned.add(guid)
-    return order, new_pinned, True, "ok"
+    if neighbor in pinned:
+        new_pinned.add(guid)
+    else:
+        new_pinned.discard(guid)
+    seen = set(new_display)
+    new_order = new_display + [g for g in library_order if g and g not in seen]
+    return new_order, new_pinned, True, "ok"
 
 
 def any_virtual_lib_enabled() -> bool:
@@ -4453,15 +4453,16 @@ async def ext_lib_enable(request: Request):
 
 @app.post("/v/api/ext/lib/move")
 async def ext_lib_move(request: Request):
-    """管理页 ↑/↓ 一步：只在同组内移动，跨置顶边界时被移动库的置顶态翻转。"""
+    """管理页 ↑/↓ 一步：在完整展示顺序里动一格；跨置顶边界时被移动库的
+    置顶态翻转为邻居的置顶态。必须传完整展示顺序，传组内子序列会导致
+    整组瞬移到最前（见 compute_lib_move）。"""
     body = await request.json()
     guid = str(body.get("guid") or "")
     direction = str(body.get("direction") or "")
     libs = _virtual_lib_list()
-    group = next((d["group"] for d in libs if d["guid"] == guid), None)
-    if group is None:
+    if not any(d["guid"] == guid for d in libs):
         return {"code": 400, "msg": "未知库 guid"}
-    displayed = [d["guid"] for d in libs if d["group"] == group]
+    displayed = [d["guid"] for d in libs]
     new_order, new_pinned, moved, msg = compute_lib_move(
         displayed, config.library_order(), config.pinned_lib_guids(), guid, direction)
     if moved:
