@@ -84,6 +84,33 @@ def _custom_match(brief: dict, keywords: list[str]) -> bool:
     hay = (brief or {}).get("type_name") or ""
     return bool(hay) and any(k and k in hay for k in keywords)
 
+
+def _allowed_key(allowed) -> tuple | None:
+    """源筛选的缓存键：None = 不限制；否则排序后的去重元组。"""
+    if not allowed:
+        return None
+    try:
+        return tuple(sorted({str(s) for s in allowed if s}))
+    except Exception:
+        return None
+
+
+def match_keywords(hay: str, include, exclude) -> bool:
+    """单库关键词过滤（纯函数，供 catalog 与 app 层复用）：
+    看给定文本子串；exclude 任一命中即排除，优先于 include；
+    include 为空 = 不要求命中。"""
+    hay = hay or ""
+    if any(k and k in hay for k in (exclude or [])):
+        return False
+    if include:
+        return any(k and k in hay for k in include)
+    return True
+
+
+def _brief_keywords_hay(brief: dict) -> str:
+    return " ".join(str((brief or {}).get(k) or "")
+                    for k in ("title", "remarks", "type_name"))
+
 # 名称关键字（匹配 type_name 子串）。顺序：动漫/综艺优先于“电影/剧”判定。
 _ANIME_KW = ("动漫", "动画", "番剧", "卡通")
 _VARIETY_KW = ("综艺", "真人秀", "脱口秀", "娱乐")
@@ -234,6 +261,11 @@ class Catalog:
         # (已过滤去重列表, 已扫描的父库偏移)。定义变更则 key 变化，旧缓存自然失效；
         # 上限 64 条防内存膨胀，超限淘汰最旧。
         self._custom_cache: dict[tuple, tuple[list[dict], int]] = {}
+        # 海量库过滤窗口缓存：key=(cat, allowed_key, include tuple, exclude tuple) ->
+        # (已过滤列表, 已扫描的父库偏移)，与 custom_window 同款扫描模式。
+        self._filtered_cache: dict[tuple, tuple[list[dict], int]] = {}
+        # 注意：_dense/_seen_guids/_scanned_page 的键是 (scope_key, allowed_key)，
+        # 不同源筛选组合各用独立密集缓冲，互不串源；allowed_key=None = 不限制。
 
     @staticmethod
     def _scope_key(scope: str, cat: str) -> str:
@@ -372,7 +404,8 @@ class Catalog:
                 self._routes = new_routes
                 for d in (self._seen_guids, self._dense, self._scanned_page):
                     for k in list(d.keys()):
-                        if k not in valid_keys:
+                        base = k[0] if isinstance(k, tuple) else k
+                        if base not in valid_keys:
                             d.pop(k, None)
                 self._updated = time.time()
             warm_scopes = [sid for sid in self.standalone_scopes()
@@ -479,17 +512,24 @@ class Catalog:
         return out
 
     async def custom_window(self, lib: dict, offset: int,
-                            limit: int) -> list[dict]:
+                            limit: int, allowed_sources=None,
+                            include=None, exclude=None) -> list[dict]:
         """子库窗口：按父库偏移顺序扫描、过滤，直到攒够 offset+limit 或父库翻完。
 
         父库窗口本身已去重，过滤后仍去重；扫描步长 100，父库 total 为上界，
         不会无限翻页。结果按父库顺序返回（与父库浏览顺序一致）。
+        过滤分两层：先 type_name 关键字（子库定义），再单库关键词
+        （include/exclude，看标题/备注/子分类名）；源筛选经父库窗口的
+        allowed_sources 落到深翻源选择。任一过滤条件变化则缓存 key 变化。
         """
         parent = lib["parent"]
         keywords = list(lib["keywords"])
+        inc = list(include or [])
+        exc = list(exclude or [])
+        akey = _allowed_key(allowed_sources)
         offset = max(0, int(offset))
         limit = max(1, min(int(limit), 100))
-        key = (lib["id"], tuple(keywords), parent)
+        key = (lib["id"], tuple(keywords), parent, akey, tuple(inc), tuple(exc))
         with self._lock:
             dense, scanned = self._custom_cache.get(key, ([], 0))
             dense = list(dense)
@@ -500,12 +540,14 @@ class Catalog:
         chunk = 100
         while len(dense) < need and scanned < parent_total:
             rows = await self.get_window(parent, scanned,
-                                         min(chunk, parent_total - scanned))
+                                         min(chunk, parent_total - scanned),
+                                         allowed_sources=allowed_sources)
             if not rows:
                 break
             scanned += len(rows)
             for b in rows:
-                if _custom_match(b, keywords):
+                if _custom_match(b, keywords) and match_keywords(
+                        _brief_keywords_hay(b), inc, exc):
                     dense.append(b)
             if len(rows) < chunk:
                 break
@@ -516,20 +558,61 @@ class Catalog:
                 self._custom_cache.pop(oldest, None)
         return dense[offset:offset + limit]
 
+    async def filtered_window(self, cat: str, offset: int, limit: int,
+                            allowed_sources=None,
+                            include=None, exclude=None) -> list[dict]:
+        """海量库过滤窗口：与 custom_window 同款扫描模式，供带源筛选或关键词
+        过滤的海量库使用。无任何过滤时调用方应直接走 get_window，避免为每个
+        无过滤请求建过滤缓存。total 仍用父库 total 作上界估计，前端以空窗
+        自然停止（与 custom_total 口径一致）。"""
+        offset = max(0, int(offset))
+        limit = max(1, min(int(limit), 100))
+        inc = list(include or [])
+        exc = list(exclude or [])
+        key = (cat, _allowed_key(allowed_sources), tuple(inc), tuple(exc))
+        with self._lock:
+            dense, scanned = self._filtered_cache.get(key, ([], 0))
+            dense = list(dense)
+        parent_total = self.total(cat)
+        if parent_total <= 0:
+            return []
+        need = offset + limit
+        chunk = 100
+        while len(dense) < need and scanned < parent_total:
+            rows = await self.get_window(cat, scanned,
+                                         min(chunk, parent_total - scanned),
+                                         allowed_sources=allowed_sources)
+            if not rows:
+                break
+            scanned += len(rows)
+            for b in rows:
+                if match_keywords(_brief_keywords_hay(b), inc, exc):
+                    dense.append(b)
+            if len(rows) < chunk:
+                break
+        with self._lock:
+            self._filtered_cache[key] = (dense, scanned)
+            if len(self._filtered_cache) > 64:
+                oldest = next(iter(self._filtered_cache))
+                self._filtered_cache.pop(oldest, None)
+        return dense[offset:offset + limit]
+
     def routes_stale(self) -> bool:
         return (not self._updated) or (time.time() - self._updated) >= CLASS_REFRESH
 
     # -------------------------------------------------- 页级抓取
-    async def _extend_dense(self, scope: str, cat: str, need_count: int) -> int:
+    async def _extend_dense(self, scope: str, cat: str, need_count: int,
+                            allowed_sources=None) -> int:
         """顺序翻页直到去重后的累计条目数达到 need_count（或翻到该源末页）。"""
         sk = self._scope_key(scope, cat)
+        dkey = (sk, _allowed_key(allowed_sources))
         pc = self.pagecount(cat, scope)
-        seen = self._seen_guids.setdefault(sk, set())
-        dense = self._dense.setdefault(sk, [])
-        pg = self._scanned_page.get(sk, 0) + 1
+        seen = self._seen_guids.setdefault(dkey, set())
+        dense = self._dense.setdefault(dkey, [])
+        pg = self._scanned_page.get(dkey, 0) + 1
         empty_streak = 0
         while len(dense) < need_count and pg <= pc:
-            rows = await self.get_page(cat, pg, scope)
+            rows = await self.get_page(cat, pg, scope, allowed_sources)
             added = 0
             for b in rows:
                 gid = b.get("guid")
@@ -538,36 +621,43 @@ class Catalog:
                 seen.add(gid); dense.append(b); added += 1
             if added:
                 # 只有真正取到新增才把游标前移，慢源抖动的空页下次可重试
-                self._scanned_page[sk] = pg
+                self._scanned_page[dkey] = pg
                 pg += 1
                 empty_streak = 0
             else:
                 # 连续多页空（超时/末页）才停止，容忍慢源的偶发抖动
                 empty_streak += 1
                 if empty_streak >= 3:
-                    self._scanned_page[sk] = pg
+                    self._scanned_page[dkey] = pg
                     break
                 pg += 1
-        self._dense_count[sk] = len(dense)
+        self._dense_count[dkey] = len(dense)
         return len(dense)
 
     async def get_window(self, cat: str, offset: int, limit: int,
-                         scope: str = AGG_SCOPE) -> list[dict]:
-        """按“去重后的全局偏移”取一窗 brief，自动顺序跨 CMS 页，密集无重复。"""
+                         scope: str = AGG_SCOPE, allowed_sources=None) -> list[dict]:
+        """按“去重后的全局偏移”取一窗 brief，自动顺序跨 CMS 页，密集无重复。
+
+        allowed_sources 不为空时只用这些源的路由深翻，且密集缓冲按源筛选
+        组合隔离（不同筛选组合互不串源）；None = 不限制，走原有单缓冲。"""
         offset = max(0, int(offset))
         limit = max(1, min(int(limit), 100))
         sk = self._scope_key(scope, cat)
-        dense = self._dense.setdefault(sk, [])
+        dkey = (sk, _allowed_key(allowed_sources))
+        dense = self._dense.setdefault(dkey, [])
         if len(dense) < offset + limit:
-            await self._extend_dense(scope, cat, offset + limit)
+            await self._extend_dense(scope, cat, offset + limit, allowed_sources)
         return dense[offset:offset + limit]
 
-    async def get_page(self, cat: str, page: int, scope: str = AGG_SCOPE) -> list[dict]:
-        """取某作用域某大类第 page 页（1 起）的可播放 brief 列表（已入库）。"""
+    async def get_page(self, cat: str, page: int, scope: str = AGG_SCOPE,
+                         allowed_sources=None) -> list[dict]:
+        """取某作用域某大类第 page 页（1 起）的可播放 brief 列表（已入库）。
+
+        页缓存键含源筛选组合，筛选变化后旧缓存不会串源。"""
         page = max(1, int(page))
         if page > MAX_PAGES:
             return []
-        key = (scope, cat, page)
+        key = (scope, cat, page, _allowed_key(allowed_sources))
         with self._lock:
             hit = self._page_cache.get(key)
             if hit:
@@ -583,7 +673,7 @@ class Catalog:
 
             async def work():
                 try:
-                    briefs = await self._load_page(scope, cat, page)
+                    briefs = await self._load_page(scope, cat, page, allowed_sources)
                     with self._lock:
                         # 空结果只短缓存，避免慢源一次抖动把该页冻结 10 分钟
                         ttl = EMPTY_TTL if not briefs else PAGE_TTL
@@ -605,10 +695,12 @@ class Catalog:
         """纯本地、零网络：从已缓存的首页/密集列表取海报，供媒体库卡片秒回。"""
         out: list[str] = []
         with self._lock:
-            # 优先已翻好的去重密集列表（最新），其次首页缓存
-            dense = self._dense.get(self._scope_key(scope, cat)) or []
+            # 优先已翻好的去重密集列表（最新），其次首页缓存。
+            # 卡片海报纯装饰：固定读不限制组合的缓存，不因子库源筛选而变，
+            # 浏览时的条目本身仍严格走筛选后的窗口。
+            dense = self._dense.get((self._scope_key(scope, cat), None)) or []
             pool = list(dense)
-            hit = self._page_cache.get((scope, cat, 1))
+            hit = self._page_cache.get((scope, cat, 1, None))
             if hit and time.time() - hit[0] < hit[2]:
                 for b in hit[1]:
                     if b not in pool:
@@ -660,11 +752,18 @@ class Catalog:
             })
         return briefs
 
-    async def _load_page(self, scope: str, cat: str, page: int) -> list[dict]:
+    async def _load_page(self, scope: str, cat: str, page: int,
+                         allowed_sources=None) -> list[dict]:
         from store import store
         with self._lock:
             routes = list(self._routes.get(self._scope_key(scope, cat)) or [])
         if scope == AGG_SCOPE:
+            # 源筛选：先按允许源过滤路由、再取前 4 条做回退链；单源作用域
+            # 本来就只有一个源，忽略该参数。
+            allowed = _allowed_key(allowed_sources)
+            if allowed is not None:
+                aset = set(allowed)
+                routes = [r for r in routes if r.get("source_id") in aset]
             routes = routes[:4]
         if not routes:
             return []
