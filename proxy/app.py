@@ -113,6 +113,42 @@ CATALOG_LIB_GUIDS: dict[str, str] = {
 }
 CATALOG_GUID_CAT = {g: c for c, g in CATALOG_LIB_GUIDS.items()}
 
+
+# —— 海量库自定义子库（复刻新增）：guid 与单源独立库同款 md5 稳定方案 ——
+def custom_lib_guid(lib_id: str) -> str:
+    return catalogmod.custom_lib_guid(lib_id)
+
+
+def custom_lib_by_guid(guid: str) -> dict | None:
+    """子库 guid 反查定义（不论隐藏与否，详情/根节点/条目端都用它解析）。"""
+    if not guid:
+        return None
+    for lib in catalogmod.valid_custom_libraries():
+        if catalogmod.custom_lib_guid(lib["id"]) == guid:
+            return lib
+    return None
+
+
+def custom_libraries_active() -> list[dict]:
+    """列表端可见的子库：海量库开关开 + 父库已建立路由 + 未被隐藏。
+
+    隐藏规则复用现有机制：子库自身 hidden，或父类在 hidden_catalog_categories
+    里，任一成立即不在列表展示（与四库隐藏语义一致：只影响列表展示，
+    不拦搜索、不删后台数据）。
+    """
+    if not catalog_enabled():
+        return []
+    out = []
+    for lib in catalogmod.valid_custom_libraries():
+        if lib.get("hidden"):
+            continue
+        if lib["parent"] in hidden_catalog_categories():
+            continue
+        if not catalog.available(lib["parent"]):
+            continue
+        out.append(lib)
+    return out
+
 # —— 单源独立媒体库：每个启用 standalone 的源生成一张库卡片 ——
 _STANDALONE_PREFIX = "fnmedia-standalone:"
 
@@ -821,6 +857,15 @@ async def _aggregate_briefs(keyword: str, maxn: int | None = None,
                    and not str(s.get("id", "")).startswith(("spider-", "drpy-"))
                    and s.get("api")
                    and s.get("id") not in ("dduo", "xiaoya")]
+    # 复刻新增：源健康阶梯停用。停用窗内的源不参与本轮聚合搜索；若过滤后为空
+    # （全部停用），回退到不过滤——健康数据绝不能导致“搜不到任何结果”。
+    # 注意：搜索“无结果”本身不记失败（见 sourcehealth），只有起播探测/播放
+    # 失败才驱动停用，所以这里过滤掉的都是已被起播失败判死的源。
+    if config.get().get("source_health_tiered", True):
+        _usable_sources = [s for s in sources
+                           if sourcehealth.usable(s.get("id", ""))]
+        if _usable_sources:
+            sources = _usable_sources
     titles = await providers.search_all(keyword, sources)
     if maxn is None:
         maxn = int(config.get().get("max_per_keyword", 12))
@@ -991,8 +1036,9 @@ def _brief_line_flags(brief: dict) -> tuple[str, int | None, set]:
                 if src_key:
                     pan_keys.add(src_key)
     pan_label = "/".join(pan_names[:3])
-    # 只在有真实探测样本时显示健康点；全死(3)且无更优时显示红点
-    live = [g for g in grades if g != 3] or grades
+    # 只在有真实探测样本时显示健康点；全死(3/4)且无更优时显示红点
+    # （4=长期停用，复刻新增等级，必须与 3 同等排除在“活线”之外）
+    live = [g for g in grades if g not in (3, 4)] or grades
     grade = min(live) if live else None
     return pan_label, grade, pan_keys
 
@@ -1229,6 +1275,8 @@ async def mediadb_list(request: Request):
     payload = await _json_from_upstream(upstream)
     dbs = payload.get("data") if payload else None
     vlib_guids = (set(CHART_LIB_GUIDS.values()) | set(CATALOG_LIB_GUIDS.values())
+                  | {custom_lib_guid(lib["id"])
+                     for lib in catalogmod.valid_custom_libraries()}
                   | {standalone_lib_guid(s["id"]) for s in config.all_sources()})
     # 官方该接口偶发鉴权/抖动失败（TV 端会整体“加载失败”）。只要拿到过有效列表，
     # 或本次列表为空，都用本地虚拟库补全；官方失败则只返回我们的虚拟库，不把错误透传给 App。
@@ -1280,6 +1328,18 @@ async def mediadb_list(request: Request):
                     "category": catalogmod.catalog_mdb(cat),
                     "view_type": 0, "poster_type": 0, "refresh_disabled": True,
                 })
+        # 2b) 海量库自定义子库（复刻新增）：卡片海报只读已过滤缓存，零网络，
+        # 与四库 cached_page_posters 的规则一致；首次打开子库前海报可能为空。
+        for lib in custom_libraries_active():
+            ps = [inj._poster(p) for p in catalog.custom_posters(lib, 8)]
+            inserts.append({
+                "guid": custom_lib_guid(lib["id"]),
+                "title": lib["title"],
+                "poster": ps[0] if ps else "",
+                "posters": ps,
+                "category": catalogmod.catalog_mdb(lib["parent"]),
+                "view_type": 0, "poster_type": 0, "refresh_disabled": True,
+            })
         # 3) 单源独立媒体库（用户在管理页为某个源勾选“作为独立媒体库”）
         for s in standalone_sources_active():
             scope = s["id"]
@@ -1398,6 +1458,29 @@ async def mdb_detail(guid: str, request: Request):
         }
         return JSONResponse({"code": 0, "msg": "", "data": payload})
 
+    # 海量库自定义子库（复刻新增）
+    _clib_detail = custom_lib_by_guid(guid)
+    if _clib_detail is not None:
+        posters = []
+        try:
+            posters = [inj._poster(p)
+                       for p in catalog.custom_posters(_clib_detail, 8)]
+        except Exception:
+            posters = []
+        payload = {
+            "guid": guid,
+            "name": _clib_detail["title"],
+            "category": catalogmod.catalog_mdb(_clib_detail["parent"]),
+            "dir_list": [], "lan": "zh-CN", "auto_scrap_subtitle": 0,
+            "include_adult": False, "subtitle_lan": "zh-CN",
+            "poster": posters[0] if posters else "",
+            "poster_type": 0, "posters": posters,
+            "view_type": 0, "last_update_time": 0, "sort_num": 0,
+            "auto_progress_thumb": 0, "skip_filesize": 0,
+            "prefer_local_nfo": 0, "refresh_disabled": True,
+        }
+        return JSONResponse({"code": 0, "msg": "", "data": payload})
+
     # 单源独立媒体库
     sscope = standalone_source_of(guid)
     if sscope and any(s["id"] == sscope for s in standalone_sources_active()):
@@ -1474,6 +1557,12 @@ async def mediadb_sum(request: Request):
                 if n:
                     payload["data"][CATALOG_LIB_GUIDS[cat]] = n
                     total_added += n
+    if catalog_enabled():
+        for lib in custom_libraries_active():
+            n = catalog.custom_total(lib)
+            if n:
+                payload["data"][custom_lib_guid(lib["id"])] = n
+                total_added += n
     for s in standalone_sources_active():
         scope = s["id"]
         if catalog.standalone_available(scope):
@@ -1542,6 +1631,35 @@ async def item_list(request: Request):
         return JSONResponse({"code": 0, "msg": "", "data": {
             "mdb_name": lib_name, "mdb_category": "Mix", "top_dir": "",
             "dir": "", "total": total, "list": rows, "jump_list": None}})
+
+    # —— 海量库自定义子库（复刻新增）：父库窗口过滤视图，前端无限滚动逐页请求 ——
+    _clib = custom_lib_by_guid(aguid) if aguid else None
+    if _clib is not None:
+        mdb_name = _clib["title"]
+        mdb_cat = catalogmod.catalog_mdb(_clib["parent"])
+        if not catalog_enabled() or not catalog.available(_clib["parent"]):
+            return JSONResponse({"code": 0, "msg": "", "data": {
+                "mdb_name": mdb_name, "mdb_category": mdb_cat, "top_dir": "",
+                "dir": "", "total": 0, "list": [], "jump_list": None}})
+        if catalog.routes_stale() and not catalog._refreshing:
+            asyncio.create_task(catalog.refresh_routes(config.enabled_sources()))
+        page = int(body.get("page") or body.get("page_index")
+                   or body.get("pn") or 1)
+        page = max(1, page)
+        page_size = int(body.get("page_size") or 22)
+        page_size = max(1, min(page_size, 100))
+        offset = int(body["offset"]) if body.get("offset") is not None \
+            else (page - 1) * page_size
+        total = catalog.custom_total(_clib)
+        offset = max(0, min(offset, total))
+        briefs = await catalog.custom_window(_clib, offset, page_size)
+        rows = _catalog_filter([_catalog_card(b, _clib["parent"])
+                                for b in briefs], body)
+        rows = clientmod.normalize_cards(rows, client)
+        return JSONResponse({"code": 0, "msg": "", "data": {
+            "mdb_name": mdb_name, "mdb_category": mdb_cat, "top_dir": "",
+            "dir": "", "total": total, "list": rows,
+            "jump_list": None}})
 
     # —— 海量分类片库：按资源站分类深翻，前端无限滚动逐页请求 ——
     ccat = CATALOG_GUID_CAT.get(aguid)
@@ -1673,6 +1791,18 @@ async def item_detail(guid: str, request: Request):
         n = catalog.total(ccat)
         data = inj._base_item(
             guid=guid, type="MediaDB", title=catalogmod.catalog_title(ccat),
+            can_play=1, number_of_episodes=n, local_number_of_episodes=n,
+            ancestor_guid="", ancestor_name="", ancestor_category="",
+            poster="", logic_type=0)
+        data["play_item_guid"] = ""
+        data["play_error"] = ""
+        return JSONResponse({"code": 0, "msg": "", "data": data})
+    # 海量库自定义子库根节点（复刻新增）
+    _clib_root = custom_lib_by_guid(guid)
+    if _clib_root is not None:
+        n = catalog.custom_total(_clib_root)
+        data = inj._base_item(
+            guid=guid, type="MediaDB", title=_clib_root["title"],
             can_play=1, number_of_episodes=n, local_number_of_episodes=n,
             ancestor_guid="", ancestor_name="", ancestor_category="",
             poster="", logic_type=0)
@@ -4092,6 +4222,13 @@ def _virtual_lib_list() -> list[dict]:
                     "group": "catalog", "enabled": catalog_enabled() and catalog.available(cat),
                     "hidden": cat in hidden_catalog_categories(),
                     "count": catalog.total(cat) if catalog.available(cat) else 0})
+    for lib in custom_libraries_active():
+        out.append({"guid": custom_lib_guid(lib["id"]), "title": lib["title"],
+                    "group": "custom", "enabled": catalog_enabled(),
+                    "hidden": bool(lib.get("hidden")) or
+                    lib["parent"] in hidden_catalog_categories(),
+                    "count": catalog.custom_total(lib)
+                    if catalog.available(lib["parent"]) else 0})
     pinned = config.pinned_lib_guids()
     for d in out:
         d["pinned"] = d["guid"] in pinned
@@ -4154,6 +4291,7 @@ async def ext_set_config(request: Request):
         "hot_per_source", "hot_pages_per_source", "hot_refresh_interval",
         "catalog_library_enabled",
         "hidden_catalog_categories", "hidden_chart_categories",
+        "source_health_tiered",
         "prefer_quality_source",
         "line_fastest", "line_fastest_max", "line_fastest_timeout",
         "line_fastest_prefer", "line_autofail",
@@ -4653,6 +4791,124 @@ async def source_health_reset(request: Request):
         body = {}
     sourcehealth.reset((body or {}).get("key"))
     return JSONResponse({"code": 0})
+
+
+@app.post("/v/api/ext/source-health/restore")
+async def source_health_restore(request: Request):
+    """一键恢复：只清停用态，保留样本历史（与 reset 清空历史不同）。"""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    sourcehealth.restore((body or {}).get("key"))
+    return JSONResponse({"code": 0})
+
+
+@app.post("/v/api/ext/source-health/probe-bitrate")
+async def source_health_probe_bitrate(request: Request):
+    """管理页显式探活：拉一次清单文本解析源标称码率，不下载分片，
+    不在起播关键路径调用。body: {key, url}。
+    另测一次首字节：首字节到达即按复用标准计一次可用（连续 2 次即自动
+    恢复停用源），首字节失败只断开恢复计数、不记源失败。返回 restored
+    表示本次探活是否触发了自动恢复。
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    key = str((body or {}).get("key") or "")
+    url = str((body or {}).get("url") or "")
+    if not key or not url:
+        return JSONResponse({"code": 400, "msg": "key 与 url 必填"}, status_code=400)
+    import streaminfo
+    bps, label = await streaminfo.probe_claimed_bitrate(url)
+    if bps:
+        sourcehealth.note_claimed_bitrate(key, bps)
+    first_byte = await streaminfo.probe_first_byte(url)
+    restored = sourcehealth.note_probe_success(key, first_byte is not None)
+    return JSONResponse({"code": 0, "data": {"key": key, "bps": bps,
+                                             "label": label,
+                                             "first_byte_latency": first_byte,
+                                             "restored": restored,
+                                             "recover_ok": sourcehealth.stats(key).get("recover_ok", 0)}})
+
+
+@app.get("/v/api/ext/filter-presets")
+async def filter_presets_list(request: Request):
+    cfg = config.get()
+    return JSONResponse({"code": 0, "data": {
+        "presets": cfg.get("filter_presets") or {},
+        "active": cfg.get("active_filter_preset")}})
+
+
+@app.post("/v/api/ext/filter-presets")
+async def filter_presets_save(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    ok, msg = config.save_filter_preset(str((body or {}).get("name") or ""),
+                                        (body or {}).get("preset") or {})
+    return JSONResponse({"code": 0 if ok else 400, "msg": msg})
+
+
+@app.post("/v/api/ext/filter-presets/activate")
+async def filter_presets_activate(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    name = (body or {}).get("name")
+    ok, msg = config.activate_filter_preset(
+        str(name) if name else None)
+    if ok:
+        try:
+            _search_cache.clear()
+        except Exception:
+            pass
+    return JSONResponse({"code": 0 if ok else 400, "msg": msg,
+                         "data": {"active": config.get().get("active_filter_preset")}})
+
+
+@app.post("/v/api/ext/filter-presets/delete")
+async def filter_presets_delete(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    ok, msg = config.delete_filter_preset(str((body or {}).get("name") or ""))
+    return JSONResponse({"code": 0 if ok else 400, "msg": msg})
+
+
+@app.get("/v/api/ext/custom-libs")
+async def custom_libs_list(request: Request):
+    libs = []
+    for lib in catalogmod.valid_custom_libraries():
+        d = dict(lib)
+        d["guid"] = catalogmod.custom_lib_guid(lib["id"])
+        d["available"] = bool(catalog.available(lib["parent"]))
+        libs.append(d)
+    return JSONResponse({"code": 0, "data": {"libs": libs}})
+
+
+@app.post("/v/api/ext/custom-libs")
+async def custom_libs_save(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    ok, msg = config.save_custom_library(body or {})
+    return JSONResponse({"code": 0 if ok else 400, "msg": msg})
+
+
+@app.post("/v/api/ext/custom-libs/delete")
+async def custom_libs_delete(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    ok, msg = config.delete_custom_library(str((body or {}).get("id") or ""))
+    return JSONResponse({"code": 0 if ok else 400, "msg": msg})
 
 
 

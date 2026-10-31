@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import threading
 import time
 from typing import Any
@@ -41,6 +42,47 @@ CATALOG_CATEGORIES = [
 # 跨源聚合的“海量四库”使用的保留作用域 id；单源独立库作用域为其 source id。
 AGG_SCOPE = "__agg__"
 CATS = [c for c, _, _ in CATALOG_CATEGORIES]
+
+# ---------------- 自定义子库（复刻新增，GoFilm 两级分类思路） ----------------
+# GoFilm 的 navCategory / filmClassify 是“大类 → 子分类”两级浏览；这里不抄
+# 它的 Go 代码与数据库模型，只借“大库下再分子库”这个浏览结构：子库定义存在
+# config.custom_catalog_libraries，匹配与窗口逻辑见 Catalog.custom_window。
+_CUSTOM_PREFIX = "fnmedia-customlib:"
+
+
+def custom_lib_guid(lib_id: str) -> str:
+    """子库 guid：与单源独立库同款 md5 稳定方案，id 不变则 guid 不变。"""
+    return hashlib.md5((_CUSTOM_PREFIX + str(lib_id)).encode()).hexdigest()
+
+
+def valid_custom_libraries() -> list[dict]:
+    """从配置读子库定义并清洗（校验逻辑唯一来源：config.clean_custom_library）。
+
+    只保留 parent 为 movie/tv 的子库；父库未建立路由时子库仍列出定义，
+    但 app 层会因 parent 不 available 而不展示卡片（与四库行为一致）。
+    """
+    try:
+        from config import config as _cfg
+        raw = _cfg.get().get("custom_catalog_libraries") or []
+    except Exception:
+        return []
+    out, seen = [], set()
+    for item in raw if isinstance(raw, list) else []:
+        try:
+            clean, _msg = _cfg.clean_custom_library(item)
+        except Exception:
+            continue
+        if clean is None or clean["id"] in seen:
+            continue
+        seen.add(clean["id"])
+        out.append(clean)
+    return out
+
+
+def _custom_match(brief: dict, keywords: list[str]) -> bool:
+    """子库匹配：只看 type_name（CMS 子分类名）子串命中任一关键字。"""
+    hay = (brief or {}).get("type_name") or ""
+    return bool(hay) and any(k and k in hay for k in keywords)
 
 # 名称关键字（匹配 type_name 子串）。顺序：动漫/综艺优先于“电影/剧”判定。
 _ANIME_KW = ("动漫", "动画", "番剧", "卡通")
@@ -188,6 +230,10 @@ class Catalog:
         self._dense_count: dict[str, int] = {}
         # (sid, cat) -> [备用叶子 route...]（首选分类探测失败时 rescue 得到）
         self._fallbacks: dict[tuple[str, str], list[dict]] = {}
+        # 自定义子库过滤缓存：key=(lib_id, keywords tuple, parent) ->
+        # (已过滤去重列表, 已扫描的父库偏移)。定义变更则 key 变化，旧缓存自然失效；
+        # 上限 64 条防内存膨胀，超限淘汰最旧。
+        self._custom_cache: dict[tuple, tuple[list[dict], int]] = {}
 
     @staticmethod
     def _scope_key(scope: str, cat: str) -> str:
@@ -407,6 +453,68 @@ class Catalog:
     def total(self, cat: str, scope: str = AGG_SCOPE) -> int:
         # 用规范源页数估算 total；最后一页条数未知，前端以空页自然停止。
         return self.pagecount(cat, scope) * PAGE_SIZE
+
+    # -------------------------------------------------- 自定义子库
+    def custom_total(self, lib: dict) -> int:
+        """子库 total：父库 total 的上界估计（与父库 total 本身 pagecount*20
+        的估计口径一致）。真实条数只有把父库翻完才知道，items 端按窗口返回，
+        前端以空窗自然停止，不依赖 total 精确。"""
+        return self.total(lib["parent"])
+
+    def custom_posters(self, lib: dict, n: int = 8) -> list[str]:
+        """子库卡片海报：只读已过滤缓存，绝不联网（mediadb/list 对超时敏感，
+        与四库 cached_page_posters 的零网络规则一致）。首次打开子库前缓存为空，
+        卡片海报为空是预期行为，打开一次后即有。"""
+        out, seen = [], set()
+        for key, (dense, _scanned) in list(self._custom_cache.items()):
+            if key[0] != lib["id"]:
+                continue
+            for b in dense:
+                poster = b.get("poster") or ""
+                if poster and poster not in seen:
+                    seen.add(poster)
+                    out.append(poster)
+                    if len(out) >= n:
+                        return out
+        return out
+
+    async def custom_window(self, lib: dict, offset: int,
+                            limit: int) -> list[dict]:
+        """子库窗口：按父库偏移顺序扫描、过滤，直到攒够 offset+limit 或父库翻完。
+
+        父库窗口本身已去重，过滤后仍去重；扫描步长 100，父库 total 为上界，
+        不会无限翻页。结果按父库顺序返回（与父库浏览顺序一致）。
+        """
+        parent = lib["parent"]
+        keywords = list(lib["keywords"])
+        offset = max(0, int(offset))
+        limit = max(1, min(int(limit), 100))
+        key = (lib["id"], tuple(keywords), parent)
+        with self._lock:
+            dense, scanned = self._custom_cache.get(key, ([], 0))
+            dense = list(dense)
+        parent_total = self.total(parent)
+        if parent_total <= 0:
+            return []
+        need = offset + limit
+        chunk = 100
+        while len(dense) < need and scanned < parent_total:
+            rows = await self.get_window(parent, scanned,
+                                         min(chunk, parent_total - scanned))
+            if not rows:
+                break
+            scanned += len(rows)
+            for b in rows:
+                if _custom_match(b, keywords):
+                    dense.append(b)
+            if len(rows) < chunk:
+                break
+        with self._lock:
+            self._custom_cache[key] = (dense, scanned)
+            if len(self._custom_cache) > 64:
+                oldest = next(iter(self._custom_cache))
+                self._custom_cache.pop(oldest, None)
+        return dense[offset:offset + limit]
 
     def routes_stale(self) -> bool:
         return (not self._updated) or (time.time() - self._updated) >= CLASS_REFRESH
