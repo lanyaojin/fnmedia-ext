@@ -132,6 +132,16 @@ tr:last-child td{border-bottom:0}
   cursor:pointer;white-space:nowrap;padding:2px 8px;border-radius:99px;border:1px solid var(--line);background:#fff}
 .lib .pin input{margin:0;accent-color:var(--accent)}
 .lib:has(.pin input:checked){border-color:var(--accent);background:var(--accent-soft)}
+.lib.lib-card{flex-direction:column;align-items:stretch}
+.lib .lib-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.lib.disabled{opacity:.55}
+.lib .mv{display:inline-flex;gap:4px}
+.lib .mv button{min-width:34px;min-height:32px;padding:4px 8px;border:1px solid var(--line);border-radius:8px;background:#fff;cursor:pointer;font-size:14px}
+.lib details summary.filt{font-size:12px;color:var(--muted);cursor:pointer;padding:4px 0}
+.lib .filt-body{display:flex;flex-direction:column;gap:8px;margin-top:6px}
+.lib .srcs{display:flex;flex-wrap:wrap;gap:8px}
+.lib .srcs label{display:inline-flex;align-items:center;gap:4px;font-size:12px}
+.lib .kw{width:100%;box-sizing:border-box}
 
 /* ---------- 优先级 ---------- */
 .prio-input{width:74px}
@@ -256,7 +266,7 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
     <!-- ============ 虚拟媒体库 ============ -->
     <section class="page" id="page-library">
       <h2 class="page-title">虚拟媒体库</h2>
-      <p class="page-desc">插件在飞牛影视媒体库中虚拟出的内容。热门榜单与海量片库各自独立开关；每张库卡可单独「置顶」。</p>
+      <p class="page-desc">插件在飞牛影视媒体库中虚拟出的内容。热门榜单与海量片库各自独立开关；每张库卡可单独开关、排序、置顶与筛选。</p>
 
       <div class="card">
         <div class="card-title">① 热门资源（各类目真实榜单）</div>
@@ -292,6 +302,12 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
           <button class="primary small" onclick="saveCatCfg()">保存海量设置</button>
         </div>
         <div class="hint">海量库在分类路由建立后自动出现；也可在「资源站」页把某个站单独生成一张媒体库卡片。</div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">③ 自定义子库（从海量电影/剧集按类型关键字切分）</div>
+        <p class="card-sub">子库定义仍走接口新建；已有子库可在这里开关、排序与筛选。子库筛选默认继承父库，单独设置后优先于父库。</p>
+        <div class="lib-grid" id="customLibs"></div>
       </div>
     </section>
 
@@ -838,20 +854,81 @@ function catKeyOf(title){
   if(/电影/.test(title))return "movie"; if(/剧/.test(title))return "tv";
   if(/动漫|番/.test(title))return "anime"; if(/综艺/.test(title))return "variety"; return "";
 }
+function libStatusText(L){
+  if(L.disabled)return "已停用";
+  if(L.hidden)return "分类已隐藏";
+  if(!L.enabled)return "组已关闭";
+  return "显示中";
+}
+function libCountText(L){
+  if(L.group==="hot")return L.count+" 条";
+  if(L.group==="custom")return L.count?("约 "+L.count+" 条"):"建库中…";
+  return L.count?("路由 "+L.count):"建库中…";
+}
 function libCardHtml(L,ic){
-  return `<div class="lib" data-g="${L.guid}"><div class="ic">${ic}</div>
+  const hasFilt=(L.sources&&L.sources.length)||(L.include_keywords&&L.include_keywords.length)||(L.exclude_keywords&&L.exclude_keywords.length);
+  const srcs=(typeof CFG!=="undefined"&&CFG&&CFG.sources)?CFG.sources.filter(s=>s.enabled):[];
+  const srcHtml=srcs.length?srcs.map(s=>{
+    const on=!L.sources||L.sources.includes(s.id);
+    return `<label><input type="checkbox" data-src="${esc(s.id)}" ${on?"checked":""}/>${esc(s.name)}</label>`;
+  }).join(""):'<span class="muted sm">源列表未加载</span>';
+  return `<div class="lib lib-card ${L.disabled?"disabled":""}" data-g="${L.guid}">
+    <div class="lib-head"><div class="ic">${ic}</div>
     <div style="flex:1;min-width:0"><div class="t">${esc(L.title)}</div>
-      <div class="c">${L.group==="hot"?(L.count+" 条"):(L.count?("路由 "+L.count):"建库中…")}</div></div>
+      <div class="c">${libCountText(L)} · ${libStatusText(L)}</div></div>
+    <label class="pin" title="停用后不在飞牛影视媒体库显示，管理页仍可重新启用">
+      <input type="checkbox" ${L.disabled?"":"checked"} onchange="toggleLibEnabled('${L.guid}',this)"/>启用</label>
     <label class="pin" title="在飞牛影视媒体库列表中置顶">
       <input type="checkbox" ${L.pinned?"checked":""} onchange="togglePin('${L.guid}',this)"/>置顶</label>
+    <span class="mv"><button title="上移" onclick="moveLib('${L.guid}','up')">↑</button><button title="下移" onclick="moveLib('${L.guid}','down')">↓</button></span>
+    </div>
+    <details><summary class="filt">源筛选 / 关键词过滤${hasFilt?" · 已筛选":""}</summary>
+    <div class="filt-body">
+      <div class="srcs">${srcHtml}</div>
+      <div><input class="kw" data-kw="inc" placeholder="包含关键词，逗号分隔，留空=不过滤" value="${esc((L.include_keywords||[]).join("，"))}"/></div>
+      <div><input class="kw" data-kw="exc" placeholder="排除关键词，逗号分隔，排除优先" value="${esc((L.exclude_keywords||[]).join("，"))}"/></div>
+      <div><button class="primary small" onclick="saveLibFilters('${L.guid}',this)">保存本库筛选</button>
+      <span class="muted sm">源全选 = 不限制；关键词留空 = 不过滤</span></div>
+    </div></details>
   </div>`;
 }
 async function togglePin(guid,el){
   try{
     const r=await jpost("/v/api/ext/lib/pin",{guid,pinned:el.checked});
-    if(r.code===0){toast(el.checked?"已置顶":"已取消置顶");LIBS.forEach(x=>{if(x.guid===guid)x.pinned=el.checked;});}
+    if(r.code===0){toast(el.checked?"已置顶":"已取消置顶");await loadLibs();renderLibrary();}
     else{el.checked=!el.checked;toast(r.msg||"设置失败","fail");}
   }catch(e){el.checked=!el.checked;toast("设置失败","fail");}
+}
+async function toggleLibEnabled(guid,el){
+  try{
+    const r=await jpost("/v/api/ext/lib/enable",{guid,enabled:el.checked});
+    if(r.code===0){toast(el.checked?"已启用":"已停用");await loadLibs();renderLibrary();}
+    else{el.checked=!el.checked;toast(r.msg||"设置失败","fail");}
+  }catch(e){el.checked=!el.checked;toast("设置失败","fail");}
+}
+async function moveLib(guid,dir){
+  try{
+    const r=await jpost("/v/api/ext/lib/move",{guid,direction:dir});
+    if(r.code===0){if(r.data&&r.data.moved){await loadLibs();renderLibrary();}else toast(r.msg||"已到顶/底");}
+    else toast(r.msg||"移动失败","fail");
+  }catch(e){toast("移动失败","fail");}
+}
+async function saveLibFilters(guid,btn){
+  try{
+    const card=btn.closest(".lib-card");
+    const boxes=[...card.querySelectorAll("[data-src]")];
+    const checked=boxes.filter(b=>b.checked).map(b=>b.dataset.src);
+    if(!boxes.length){toast("源列表未加载","fail");return;}
+    if(!checked.length){toast("至少选一个源","fail");return;}
+    const allChecked=checked.length===boxes.length;
+    const inc=card.querySelector('[data-kw="inc"]').value||"";
+    const exc=card.querySelector('[data-kw="exc"]').value||"";
+    const r1=await jpost("/v/api/ext/lib/sources",{guid,sources:allChecked?[]:checked});
+    if(r1.code!==0){toast(r1.msg||"源筛选保存失败","fail");return;}
+    const r2=await jpost("/v/api/ext/lib/keywords",{guid,include:inc,exclude:exc});
+    if(r2.code===0){toast("本库筛选已保存");await loadLibs();renderLibrary();}
+    else toast(r2.msg||"关键词保存失败","fail");
+  }catch(e){toast("保存失败","fail");}
 }
 function renderLibrary(){
   if(!STATUS)return;
@@ -871,6 +948,9 @@ function renderLibrary(){
       .map(([k,t])=>{const n=(cats[k]||{}).routes||0;
         return `<div class="lib"><div class="ic">🌐</div><div><div class="t">${t}</div><div class="c">${n?("路由 "+n):"建库中…"}</div></div></div>`;}).join("");
   }
+  $("customLibs").innerHTML=LIBS.length
+    ?(LIBS.filter(x=>x.group==="custom").map(L=>libCardHtml(L,"✂️")).join("")||'<div class="muted sm">暂无自定义子库</div>')
+    :'<div class="muted sm">暂无自定义子库</div>';
   $("hotStatus").textContent=(STATUS.charts&&STATUS.charts.refreshing?"正在后台刷新榜单…":"最近刷新："+fmtTs(STATUS.charts&&STATUS.charts.updated_at))
     +` · 数据源 ${(STATUS.charts&&STATUS.charts.provider_ok)||0}/${(STATUS.charts&&STATUS.charts.provider_total)||0}`
     +(STATUS.charts&&STATUS.charts.last_error?(" · "+STATUS.charts.last_error):"");

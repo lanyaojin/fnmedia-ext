@@ -77,6 +77,21 @@ DEFAULTS = {
     "guard_native_enabled": True,
     # 置顶的虚拟媒体库 guid 集合（打开=在飞牛影视媒体库列表置顶，关闭=普通顺序）。
     "pinned_libs": [],
+    # 复刻新增：单库控制（启用 / 排序 / 源筛选 / 关键词过滤），默认全部等于现状，
+    # 部署后不改变任何可见行为，只有用户在管理页点了开关才生效。
+    # disabled_lib_guids：被用户停用的虚拟库 guid 列表（空 = 全部启用）。
+    #   停用同时影响媒体库列表与直接打开（与整组开关关闭行为一致），
+    #   与按分类隐藏不同：隐藏只影响列表展示。
+    # library_order：虚拟库 guid 全局顺序；展示时置顶组在前、组内按此顺序，
+    #   未列出的新库按原有顺序追加在组末（永不消失）。
+    # lib_sources：{guid: [source_id, ...]}，该库允许的源；缺失或空 = 全部启用源。
+    #   未知/已删源 id 读时丢弃，绝不崩溃。
+    # lib_keywords：{guid: {include: [...], exclude: [...]}}，条目级关键词过滤；
+    #   匹配看标题/备注/子分类名子串，exclude 优先于 include；空 = 不过滤。
+    "disabled_lib_guids": [],
+    "library_order": [],
+    "lib_sources": {},
+    "lib_keywords": {},
     "hot_library_title": "🌐在线热门",
     "hot_limit": 300,          # 四库合计保留条数上限
     "hot_per_source": 120,    # 每个资源站最多抓取的可播条目
@@ -311,6 +326,129 @@ class Config:
             cfg["pinned_libs"] = cur
             self._persist(cfg)
             return True, "ok"
+
+    # ---------------- 单库控制（复刻新增） ----------------
+    _LIB_KW_MAX = 20
+
+    def disabled_lib_guids(self) -> set:
+        with _LOCK:
+            try:
+                return {g for g in (self.get().get("disabled_lib_guids") or [])
+                        if isinstance(g, str) and g}
+            except TypeError:
+                return set()
+
+    def set_lib_disabled(self, guid: str, on: bool) -> tuple[bool, str]:
+        if not isinstance(guid, str) or not guid:
+            return False, "guid 非法"
+        with _LOCK:
+            cfg = self.get()
+            cur = [g for g in (cfg.get("disabled_lib_guids") or [])
+                   if isinstance(g, str) and g]
+            if on:
+                if guid not in cur:
+                    cur.append(guid)
+            else:
+                cur = [g for g in cur if g != guid]
+            cfg["disabled_lib_guids"] = cur
+            self._persist(cfg)
+        return True, "ok"
+
+    def library_order(self) -> list:
+        with _LOCK:
+            try:
+                return [g for g in (self.get().get("library_order") or [])
+                        if isinstance(g, str) and g]
+            except TypeError:
+                return []
+
+    @staticmethod
+    def _clean_guid_list(raw, cap: int = 500) -> list:
+        out, seen = [], set()
+        if isinstance(raw, list):
+            for g in raw:
+                if isinstance(g, str) and g and g not in seen:
+                    seen.add(g)
+                    out.append(g)
+                    if len(out) >= cap:
+                        break
+        return out
+
+    def set_library_order(self, order) -> tuple[bool, str]:
+        with _LOCK:
+            cfg = self.get()
+            cfg["library_order"] = self._clean_guid_list(order)
+            self._persist(cfg)
+        return True, "ok"
+
+    def known_source_ids(self) -> set:
+        with _LOCK:
+            return {s["id"] for s in self.get().get("sources", [])
+                    if isinstance(s, dict) and s.get("id")}
+
+    def lib_sources(self, guid: str) -> list | None:
+        """该库允许的源 id 列表；None = 不限制（全部启用源）。
+
+        保存过的未知/已删源 id 读时丢弃；丢弃后为空则视为不限制。"""
+        with _LOCK:
+            raw = (self.get().get("lib_sources") or {}).get(guid)
+            if not isinstance(raw, list) or not raw:
+                return None
+            known = self.known_source_ids()
+            out = [s for s in raw if isinstance(s, str) and s in known]
+            return out or None
+
+    def set_lib_sources(self, guid: str, ids) -> tuple[bool, str]:
+        if not isinstance(guid, str) or not guid:
+            return False, "guid 非法"
+        if ids is None or (isinstance(ids, list) and not ids):
+            # 空 = 清除限制，回到全部启用源
+            with _LOCK:
+                cfg = self.get()
+                mapping = dict(cfg.get("lib_sources") or {})
+                mapping.pop(guid, None)
+                cfg["lib_sources"] = mapping
+                self._persist(cfg)
+            return True, "ok"
+        if not isinstance(ids, list):
+            return False, "sources 须为列表"
+        with _LOCK:
+            cfg = self.get()
+            known = self.known_source_ids()
+            clean = [s for s in ids if isinstance(s, str) and s in known]
+            if not clean:
+                return False, "sources 里没有已知源（未知 id 已忽略）"
+            mapping = dict(cfg.get("lib_sources") or {})
+            mapping[guid] = clean
+            cfg["lib_sources"] = mapping
+            self._persist(cfg)
+        return True, "ok"
+
+    def lib_keywords(self, guid: str) -> dict:
+        with _LOCK:
+            raw = (self.get().get("lib_keywords") or {}).get(guid)
+            if not isinstance(raw, dict):
+                return {"include": [], "exclude": []}
+            return {
+                "include": self.normalize_keywords(raw.get("include"))[:self._LIB_KW_MAX],
+                "exclude": self.normalize_keywords(raw.get("exclude"))[:self._LIB_KW_MAX],
+            }
+
+    def set_lib_keywords(self, guid: str, include, exclude) -> tuple[bool, str]:
+        if not isinstance(guid, str) or not guid:
+            return False, "guid 非法"
+        inc = self.normalize_keywords(include)[:self._LIB_KW_MAX]
+        exc = self.normalize_keywords(exclude)[:self._LIB_KW_MAX]
+        with _LOCK:
+            cfg = self.get()
+            mapping = dict(cfg.get("lib_keywords") or {})
+            if not inc and not exc:
+                mapping.pop(guid, None)
+            else:
+                mapping[guid] = {"include": inc, "exclude": exc}
+            cfg["lib_keywords"] = mapping
+            self._persist(cfg)
+        return True, "ok"
 
     def set_loose_filter(self, sid: str, on: bool) -> tuple[bool, str]:
         """放宽正片（标题/备注噪音）过滤；分类层面的红线不受影响。"""

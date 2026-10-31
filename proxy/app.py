@@ -209,6 +209,76 @@ def hidden_chart_categories() -> set[str]:
     return _hidden_categories("hidden_chart_categories")
 
 
+# —— 单库控制（复刻新增）：启用 / 排序 / 源筛选 / 关键词过滤 ——
+# sort_lib_cards 与 compute_lib_move 是纯函数（只收显式参数），便于单测；
+# 配置读写由调用方（端点）负责。
+def managed_lib_guids() -> set:
+    """管理页可管的库 guid：热门四库 + 海量四库 + 自定义子库。"""
+    guids = set(CHART_LIB_GUIDS.values()) | set(CATALOG_LIB_GUIDS.values())
+    for lib in catalogmod.valid_custom_libraries():
+        guids.add(catalogmod.custom_lib_guid(lib["id"]))
+    return guids
+
+
+def lib_effective_sources(guid: str) -> list | None:
+    """该库实际生效的源筛选：None = 不限制（全部启用源）。
+
+    自定义子库：自身筛选优先，未设则继承父库筛选；其余库直接取自身筛选。"""
+    own = config.lib_sources(guid)
+    if own is not None:
+        return own
+    lib = custom_lib_by_guid(guid)
+    if lib is not None:
+        return config.lib_sources(CATALOG_LIB_GUIDS[lib["parent"]])
+    return None
+
+
+def sort_lib_cards(cards: list[dict], order: list, pinned: set) -> list[dict]:
+    """把虚拟库卡片排成 App 展示顺序：置顶组在前、组内按 order；
+    未列入 order 的按原有相对顺序追加在组末（稳定排序，永不消失）。"""
+    pos = {g: i for i, g in enumerate(order)}
+    big = len(pos)
+    pinned_cards = sorted((d for d in cards if d["guid"] in pinned),
+                          key=lambda d: pos.get(d["guid"], big))
+    normal_cards = sorted((d for d in cards if d["guid"] not in pinned),
+                          key=lambda d: pos.get(d["guid"], big))
+    return pinned_cards + normal_cards
+
+
+def compute_lib_move(displayed_guids: list[str], library_order: list[str],
+                     pinned: set, guid: str, direction: str):
+    """计算管理页 ↑/↓ 一步：返回 (new_order, new_pinned, moved, msg)。
+
+    displayed_guids 是同组（hot/catalog/custom）卡片在 App 展示顺序中的
+    guid 序列；移动只在组内进行，跨置顶边界时被移动库的置顶态随之翻转，
+    保证移动后的展示顺序与用户点的方向一致。纯函数，不碰配置。"""
+    if direction not in ("up", "down"):
+        return list(library_order), set(pinned), False, "方向非法"
+    if guid not in displayed_guids:
+        return list(library_order), set(pinned), False, "库不存在"
+    idx = displayed_guids.index(guid)
+    target = idx - 1 if direction == "up" else idx + 1
+    if target < 0 or target >= len(displayed_guids):
+        return list(library_order), set(pinned), False, \
+            "已到顶" if direction == "up" else "已到底"
+    neighbor = displayed_guids[target]
+    order = [g for g in library_order if g]
+    seen = set(order)
+    for g in displayed_guids:
+        if g not in seen:
+            order.append(g)
+            seen.add(g)
+    i, j = order.index(guid), order.index(neighbor)
+    order[i], order[j] = order[j], order[i]
+    new_pinned = set(pinned)
+    if (guid in pinned) != (neighbor in pinned):
+        if guid in new_pinned:
+            new_pinned.discard(guid)
+        else:
+            new_pinned.add(guid)
+    return order, new_pinned, True, "ok"
+
+
 def any_virtual_lib_enabled() -> bool:
     if charts_enabled() or catalog_enabled():
         return True
@@ -290,10 +360,30 @@ def chart_card(item: dict) -> dict:
     }
 
 
+def _chart_stored_fresh(guid: str, existing) -> bool:
+    """已解析的榜单标题是否仍符合当前源筛选；不符合则需重新解析。
+
+    解析时把当时生效的源筛选指纹记在 bound["chart"]["src_filter"] 里；
+    筛选变化后旧解析的指纹对不上，下次点击即重新按新筛选解析并覆盖。
+    非榜单解析产物（无 chart 键）沿用原有逻辑，返回 True。"""
+    if not isinstance(existing, dict):
+        return False
+    ch = existing.get("chart")
+    if not isinstance(ch, dict):
+        return True
+    item = chart_cache.get_guid(guid)
+    if not item:
+        return True
+    cg = CHART_LIB_GUIDS.get(item.get("cat"), "")
+    cur = config.lib_sources(cg) if cg else None
+    cur_fp = sorted(cur) if cur else None
+    return ch.get("src_filter") == cur_fp
+
+
 def start_resolve_chart(guid: str) -> asyncio.Future | None:
     """启动榜单 guid 的后台解析（单飞），立即返回在途 Future；不阻塞当前请求。"""
     existing = store.get_title_by_guid(guid)
-    if existing:
+    if existing and _chart_stored_fresh(guid, existing):
         return None
     if time.time() - _CHART_FAILED_TS.get(guid, 0) < _CHART_FAILED_TTL:
         return None
@@ -309,8 +399,12 @@ def start_resolve_chart(guid: str) -> asyncio.Future | None:
             if not item:
                 fut.set_result(None)
                 return
+            _chart_guid = CHART_LIB_GUIDS.get(item["cat"], "")
+            _allowed = config.lib_sources(_chart_guid) if _chart_guid else None
             briefs = await asyncio.wait_for(
-                _aggregate_briefs(item["title"], 12), timeout=25)
+                _aggregate_briefs(item["title"], 12,
+                                  allowed_sources=set(_allowed) if _allowed else None),
+                timeout=25)
             # 相关性：归一化片名必须包含完整榜单片名（分词全部命中），否则视为无源
             want = _norm_title(item["title"])
             want_tokens = [_norm_title(t) for t in re.split(r"[\s]+", item["title"]) if _norm_title(t)]
@@ -330,7 +424,8 @@ def start_resolve_chart(guid: str) -> asyncio.Future | None:
                 bound["guid"] = guid
                 bound["chart"] = {"title": item["title"], "cat": item["cat"],
                                   "cover": item.get("cover", ""),
-                                  "rating": item.get("rating", 0)}
+                                  "rating": item.get("rating", 0),
+                                  "src_filter": sorted(_allowed) if _allowed else None}
                 _chart_resolved[guid] = bound
                 store.remember_merged([bound])
                 _PENDING_MEDIA_CHART.pop(media_guid(guid), None)
@@ -353,7 +448,7 @@ async def resolve_chart(guid: str) -> dict | None:
     单 flight；命中后在内存和 store 都登记，之后整条 season/episode/play 链复用。
     """
     existing = store.get_title_by_guid(guid)
-    if existing:
+    if existing and _chart_stored_fresh(guid, existing):
         return existing
     fut = start_resolve_chart(guid)
     if fut is None:
@@ -844,13 +939,19 @@ async def forward_upstream_streaming(request: Request) -> Response:
 # ------------------------------------------------------------- 在线搜索
 
 async def _aggregate_briefs(keyword: str, maxn: int | None = None,
-                            fast_only: bool = False) -> list[dict]:
+                            fast_only: bool = False,
+                            allowed_sources: set[str] | None = None) -> list[dict]:
     """聚合搜索所有启用源 → 跨源合并 → 去噪/去无直链 → brief 列表（已入库）。
     fast_only=True 时只查秒回的标准 CMS 直链源（跳过加固/drpy 等慢源），供播放
     失败时快速回源，避免被 redroid 慢源拖到网关超时。"""
     # 可选特性源不进入全局搜索（公开构建下该开关恒关，等价于不过滤）。
     sources = [s for s in config.enabled_sources()
                if not (features.ADULT and s.get("adult"))]
+    # 单库源筛选（仅榜单解析等带库上下文的调用传）：先把源池收窄到允许源，
+    # 其后的健康停用过滤与“全部停用则回退不过滤”都在收窄后的池子里算，
+    # 绝不会因健康回退把用户排除的源又放回来。
+    if allowed_sources is not None:
+        sources = [s for s in sources if s["id"] in allowed_sources]
     if fast_only:
         sources = [s for s in sources
                    if not s.get("guard") and not s.get("spider_src")
@@ -1371,12 +1472,17 @@ async def mediadb_list(request: Request):
         # 海报只读缓存（后台预热），绝不在此联网——该接口对超时极敏感。
 
         # 5) 小雅分类媒体库（电影/剧集/综艺/动漫/纪录片/短剧 各一张卡片）
-        # —— 置顶控制 ——
-        # 置顶库（pinned_libs）插到列表最前并给较大 sort_num；未置顶的虚拟库仍排在
-        # 官方本地库之前，但置于置顶组之后。客户端按返回顺序/ sort_num 展示。
+        # —— 单库控制：停用过滤 + 置顶分组 + 用户排序 ——
+        # 停用的库整张不出（与整组开关关闭一致）；置顶组在前，组内按
+        # library_order，未列入 order 的新库按原有顺序追加在组末。
+        disabled = config.disabled_lib_guids()
+        if disabled:
+            inserts = [d for d in inserts if d["guid"] not in disabled]
+        ordered = sort_lib_cards(inserts, config.library_order(),
+                                 config.pinned_lib_guids())
         pinned_set = config.pinned_lib_guids()
-        pinned = [d for d in inserts if d["guid"] in pinned_set]
-        normal = [d for d in inserts if d["guid"] not in pinned_set]
+        pinned = [d for d in ordered if d["guid"] in pinned_set]
+        normal = [d for d in ordered if d["guid"] not in pinned_set]
         for i, d in enumerate(pinned):
             d["sort_num"] = 10_000_000 - i
         for d in normal:
@@ -1540,9 +1646,12 @@ async def mediadb_sum(request: Request):
     if not payload or not isinstance(payload.get("data"), dict):
         return upstream
     total_added = 0
+    disabled = config.disabled_lib_guids()
     if charts_enabled():
         for cat, _t, _c in chartmod.CHART_CATEGORIES:
             if cat in hidden_chart_categories():
+                continue
+            if CHART_LIB_GUIDS[cat] in disabled:
                 continue
             n = len(chart_cache.items(cat))
             if n:
@@ -1552,6 +1661,8 @@ async def mediadb_sum(request: Request):
         for cat, _t, _c in catalogmod.CATALOG_CATEGORIES:
             if cat in hidden_catalog_categories():
                 continue
+            if CATALOG_LIB_GUIDS[cat] in disabled:
+                continue
             if catalog.available(cat):
                 n = catalog.total(cat)
                 if n:
@@ -1559,12 +1670,16 @@ async def mediadb_sum(request: Request):
                     total_added += n
     if catalog_enabled():
         for lib in custom_libraries_active():
+            if custom_lib_guid(lib["id"]) in disabled:
+                continue
             n = catalog.custom_total(lib)
             if n:
                 payload["data"][custom_lib_guid(lib["id"])] = n
                 total_added += n
     for s in standalone_sources_active():
         scope = s["id"]
+        if standalone_lib_guid(scope) in disabled:
+            continue
         if catalog.standalone_available(scope):
             pool = list(catalogmod.CATALOG_CATEGORIES)
             if features.ADULT and s.get("adult"):
@@ -1604,6 +1719,10 @@ async def item_list(request: Request):
             any(s["id"] == sscope for s in standalone_sources_active()):
         src = next((s for s in config.all_sources() if s["id"] == sscope), {})
         lib_name = standalone_lib_name(src)
+        if standalone_lib_guid(sscope) in config.disabled_lib_guids():
+            return JSONResponse({"code": 0, "msg": "", "data": {
+                "mdb_name": lib_name, "mdb_category": "Mix", "top_dir": "",
+                "dir": "", "total": 0, "list": [], "jump_list": None}})
         if not catalog.standalone_available(sscope):
             if catalog.routes_stale() and not catalog._refreshing:
                 asyncio.create_task(
@@ -1637,6 +1756,10 @@ async def item_list(request: Request):
     if _clib is not None:
         mdb_name = _clib["title"]
         mdb_cat = catalogmod.catalog_mdb(_clib["parent"])
+        if custom_lib_guid(_clib["id"]) in config.disabled_lib_guids():
+            return JSONResponse({"code": 0, "msg": "", "data": {
+                "mdb_name": mdb_name, "mdb_category": mdb_cat, "top_dir": "",
+                "dir": "", "total": 0, "list": [], "jump_list": None}})
         if not catalog_enabled() or not catalog.available(_clib["parent"]):
             return JSONResponse({"code": 0, "msg": "", "data": {
                 "mdb_name": mdb_name, "mdb_category": mdb_cat, "top_dir": "",
@@ -1652,7 +1775,12 @@ async def item_list(request: Request):
             else (page - 1) * page_size
         total = catalog.custom_total(_clib)
         offset = max(0, min(offset, total))
-        briefs = await catalog.custom_window(_clib, offset, page_size)
+        _clib_guid = custom_lib_guid(_clib["id"])
+        _clib_kw = config.lib_keywords(_clib_guid)
+        briefs = await catalog.custom_window(
+            _clib, offset, page_size,
+            allowed_sources=lib_effective_sources(_clib_guid),
+            include=_clib_kw["include"], exclude=_clib_kw["exclude"])
         rows = _catalog_filter([_catalog_card(b, _clib["parent"])
                                 for b in briefs], body)
         rows = clientmod.normalize_cards(rows, client)
@@ -1666,6 +1794,10 @@ async def item_list(request: Request):
     if ccat is not None:
         mdb_name = catalogmod.catalog_title(ccat)
         mdb_cat = catalogmod.catalog_mdb(ccat)
+        if CATALOG_LIB_GUIDS[ccat] in config.disabled_lib_guids():
+            return JSONResponse({"code": 0, "msg": "", "data": {
+                "mdb_name": mdb_name, "mdb_category": mdb_cat, "top_dir": "",
+                "dir": "", "total": 0, "list": [], "jump_list": None}})
         if not catalog_enabled() or not catalog.available(ccat):
             return JSONResponse({"code": 0, "msg": "", "data": {
                 "mdb_name": mdb_name, "mdb_category": mdb_cat, "top_dir": "",
@@ -1682,7 +1814,15 @@ async def item_list(request: Request):
             else (page - 1) * page_size
         total = catalog.total(ccat)
         offset = max(0, min(offset, total))
-        briefs = await catalog.get_window(ccat, offset, page_size)
+        _ccat_guid = CATALOG_LIB_GUIDS[ccat]
+        _ccat_src = config.lib_sources(_ccat_guid)
+        _ccat_kw = config.lib_keywords(_ccat_guid)
+        if _ccat_src is not None or _ccat_kw["include"] or _ccat_kw["exclude"]:
+            briefs = await catalog.filtered_window(
+                ccat, offset, page_size, allowed_sources=_ccat_src,
+                include=_ccat_kw["include"], exclude=_ccat_kw["exclude"])
+        else:
+            briefs = await catalog.get_window(ccat, offset, page_size)
         rows = _catalog_filter([_catalog_card(b, ccat) for b in briefs], body)
         rows = clientmod.normalize_cards(rows, client)
         return JSONResponse({"code": 0, "msg": "", "data": {
@@ -1699,6 +1839,11 @@ async def item_list(request: Request):
         return await forward_upstream(request)
     mdb_name = chartmod.chart_cat_title(cat)
     mdb_cat = chartmod.chart_cat_mdb(cat)
+    if CHART_LIB_GUIDS[cat] in config.disabled_lib_guids():
+        return JSONResponse({"code": 0, "msg": "", "data": {
+            "mdb_name": mdb_name, "mdb_category": mdb_cat, "top_dir": "",
+            "dir": "", "total": 0, "list": [], "jump_list": None,
+        }})
     if not charts_enabled():
         return JSONResponse({"code": 0, "msg": "", "data": {
             "mdb_name": mdb_name, "mdb_category": mdb_cat, "top_dir": "",
@@ -1712,6 +1857,12 @@ async def item_list(request: Request):
     except Exception:
         pass
     all_rows = _chart_rows_all(body, cat)
+    _chart_kw = config.lib_keywords(CHART_LIB_GUIDS[cat])
+    if _chart_kw["include"] or _chart_kw["exclude"]:
+        all_rows = [r for r in all_rows if catalogmod.match_keywords(
+            (r.get("title") or "") + " " + (r.get("overview") or "") + " " +
+            " ".join(r.get("genres") or []),
+            _chart_kw["include"], _chart_kw["exclude"])]
     page_size, start, end = _page_args(body, len(all_rows))
     out_rows = all_rows[start:end]
     out_rows = clientmod.normalize_cards(out_rows, client)
@@ -4210,7 +4361,13 @@ async def ext_source_priority(request: Request):
 
 
 def _virtual_lib_list() -> list[dict]:
-    """供管理台展示的虚拟媒体库清单（热门四库 / 海量四库），含开关与置顶态。"""
+    """供管理台展示的虚拟媒体库清单（热门四库 / 海量四库 / 自定义子库）。
+
+    顺序与 mediadb/list 展示顺序一致：置顶组在前、组内按 library_order。
+    停用的库仍列出（disabled=true），管理页据此灰显并可重新启用——停用
+    绝不能让库在管理页里消失。自定义子库此前仅列 active 的（自身 hidden
+    的在管理页不可见、无法从 UI 恢复）；这里改列全部有效定义，hidden
+    仅作标记；父库未建路由的 count 为 0、enabled 为 False。"""
     out = []
     for cat, title, _c in chartmod.CHART_CATEGORIES:
         out.append({"guid": CHART_LIB_GUIDS[cat], "title": title,
@@ -4222,17 +4379,44 @@ def _virtual_lib_list() -> list[dict]:
                     "group": "catalog", "enabled": catalog_enabled() and catalog.available(cat),
                     "hidden": cat in hidden_catalog_categories(),
                     "count": catalog.total(cat) if catalog.available(cat) else 0})
-    for lib in custom_libraries_active():
+    for lib in catalogmod.valid_custom_libraries():
         out.append({"guid": custom_lib_guid(lib["id"]), "title": lib["title"],
-                    "group": "custom", "enabled": catalog_enabled(),
+                    "group": "custom",
+                    "enabled": catalog_enabled() and catalog.available(lib["parent"]),
                     "hidden": bool(lib.get("hidden")) or
                     lib["parent"] in hidden_catalog_categories(),
                     "count": catalog.custom_total(lib)
                     if catalog.available(lib["parent"]) else 0})
     pinned = config.pinned_lib_guids()
-    for d in out:
+    disabled = config.disabled_lib_guids()
+    ordered = sort_lib_cards(out, config.library_order(), pinned)
+    for i, d in enumerate(ordered):
         d["pinned"] = d["guid"] in pinned
-    return out
+        d["disabled"] = d["guid"] in disabled
+        d["visible"] = bool(d["enabled"]) and not d["hidden"] and not d["disabled"]
+        d["order"] = i
+        d["sources"] = config.lib_sources(d["guid"])
+        kw = config.lib_keywords(d["guid"])
+        d["include_keywords"] = kw["include"]
+        d["exclude_keywords"] = kw["exclude"]
+    return ordered
+
+
+def _clear_chart_failed_for_lib(guid: str) -> None:
+    """某热门库源筛选变化后，让该库已失败过的榜单片能立即按新筛选重试
+    （失败短时记忆与内存解析缓存只清该库条目，不动 store 持久标题；
+    持久标题的筛选指纹对不上时下次点击自动重新解析）。"""
+    cat = CHART_GUID_CAT.get(guid)
+    if cat is None:
+        return
+    try:
+        for it in chart_cache.items(cat):
+            g = it.get("guid")
+            if g:
+                _CHART_FAILED_TS.pop(g, None)
+                _chart_resolved.pop(g, None)
+    except Exception:
+        pass
 
 
 @app.get("/v/api/ext/libs")
@@ -4251,6 +4435,91 @@ async def ext_lib_pin(request: Request):
     ok, msg = config.set_lib_pinned(guid, on)
     return {"code": 0 if ok else 400, "msg": msg,
             "data": {"pinned_libs": sorted(config.pinned_lib_guids())}}
+
+
+@app.post("/v/api/ext/lib/enable")
+async def ext_lib_enable(request: Request):
+    """单库启用开关：enabled=false 即把 guid 记入 disabled（列表与直接打开
+    都不再出该库）；管理页仍列出该库，可随时重新启用。"""
+    body = await request.json()
+    guid = str(body.get("guid") or "")
+    on = bool(body.get("enabled"))
+    if guid not in managed_lib_guids() and standalone_source_of(guid) is None:
+        return {"code": 400, "msg": "未知库 guid"}
+    ok, msg = config.set_lib_disabled(guid, not on)
+    return {"code": 0 if ok else 400, "msg": msg,
+            "data": {"disabled": sorted(config.disabled_lib_guids())}}
+
+
+@app.post("/v/api/ext/lib/move")
+async def ext_lib_move(request: Request):
+    """管理页 ↑/↓ 一步：只在同组内移动，跨置顶边界时被移动库的置顶态翻转。"""
+    body = await request.json()
+    guid = str(body.get("guid") or "")
+    direction = str(body.get("direction") or "")
+    libs = _virtual_lib_list()
+    group = next((d["group"] for d in libs if d["guid"] == guid), None)
+    if group is None:
+        return {"code": 400, "msg": "未知库 guid"}
+    displayed = [d["guid"] for d in libs if d["group"] == group]
+    new_order, new_pinned, moved, msg = compute_lib_move(
+        displayed, config.library_order(), config.pinned_lib_guids(), guid, direction)
+    if moved:
+        config.set_library_order(new_order)
+        cur_pinned = config.pinned_lib_guids()
+        for g in (new_pinned - cur_pinned):
+            config.set_lib_pinned(g, True)
+        for g in (cur_pinned - new_pinned):
+            config.set_lib_pinned(g, False)
+    return {"code": 0, "msg": msg,
+            "data": {"moved": moved,
+                     "libs": [d["guid"] for d in _virtual_lib_list()]}}
+
+
+@app.post("/v/api/ext/lib/order")
+async def ext_lib_order(request: Request):
+    """整体保存库顺序：清洗为去重字符串列表（上限 500）；未列入的库按原有
+    顺序追加在组末。已删子库的 guid 容忍残留（guid 由 id 稳定生成，删后
+    重建同 id 子库时顺序自动恢复），不报错。"""
+    body = await request.json()
+    order = body.get("order")
+    if not isinstance(order, list):
+        return {"code": 400, "msg": "order 须为列表"}
+    ok, msg = config.set_library_order(order)
+    return {"code": 0 if ok else 400, "msg": msg,
+            "data": {"order": config.library_order()}}
+
+
+@app.post("/v/api/ext/lib/sources")
+async def ext_lib_sources(request: Request):
+    """单库源筛选：sources 为允许源 id 列表，空/缺失 = 清除限制（全部启用源）；
+    未知源 id 由 config 层忽略，全部未知则报错、保持原值。仅热门/海量/
+    自定义子库支持（单源独立库本身只有一个源，无需筛选）。"""
+    body = await request.json()
+    guid = str(body.get("guid") or "")
+    if guid not in managed_lib_guids():
+        return {"code": 400, "msg": "仅热门/海量/自定义子库支持源筛选"}
+    ids = body.get("sources")
+    if ids is not None and not isinstance(ids, list):
+        return {"code": 400, "msg": "sources 须为列表（空 = 全部源）"}
+    ok, msg = config.set_lib_sources(guid, ids)
+    if ok:
+        _clear_chart_failed_for_lib(guid)
+    return {"code": 0 if ok else 400, "msg": msg,
+            "data": {"sources": config.lib_sources(guid)}}
+
+
+@app.post("/v/api/ext/lib/keywords")
+async def ext_lib_keywords(request: Request):
+    """单库关键词过滤：include/exclude 各最多 20 个、每词最多 30 字（与噪音词
+    清洗口径一致）；两空 = 清除过滤。仅热门/海量/自定义子库支持。"""
+    body = await request.json()
+    guid = str(body.get("guid") or "")
+    if guid not in managed_lib_guids():
+        return {"code": 400, "msg": "仅热门/海量/自定义子库支持关键词过滤"}
+    ok, msg = config.set_lib_keywords(guid, body.get("include"), body.get("exclude"))
+    return {"code": 0 if ok else 400, "msg": msg,
+            "data": config.lib_keywords(guid)}
 
 
 @app.post("/v/api/ext/hot/refresh")
@@ -4296,6 +4565,8 @@ async def ext_set_config(request: Request):
         "line_fastest", "line_fastest_max", "line_fastest_timeout",
         "line_fastest_prefer", "line_autofail",
         "update_proxy",
+        # 复刻新增：单库控制（批量保存同样走清洗，非法值丢弃不报错崩溃）
+        "disabled_lib_guids", "library_order", "lib_sources", "lib_keywords",
     }
     patch = {k: v for k, v in body.items() if k in allowed}
     # 复刻定制：隐藏分类只接受四类 id，非法值丢弃、去重保序，避免拼错藏空整个库。
@@ -4308,6 +4579,33 @@ async def ext_set_config(request: Request):
                     _seen.add(_c)
                     _clean.append(_c)
             patch[_hk] = _clean
+    # 复刻新增：单库控制批量清洗。guid 列表去重保序；源筛选只保留已知库
+    # 与已知源、空则删条目（=全部源）；关键词走噪音词清洗口径并各 cap 20。
+    for _gl in ("disabled_lib_guids", "library_order"):
+        if _gl in patch:
+            _seen, _clean = set(), []
+            for _g in patch[_gl] if isinstance(patch[_gl], list) else []:
+                if isinstance(_g, str) and _g and _g not in _seen:
+                    _seen.add(_g)
+                    _clean.append(_g)
+            patch[_gl] = _clean[:500]
+    # lib_sources / lib_keywords 批量：逐条走与单条端点相同的 setter（清洗、
+    # 未知源忽略、空 = 清除限制），失败条目保持原值；随后从 patch 里弹出，
+    # 避免 config.save 用原始值覆盖 setter 结果。
+    if "lib_sources" in patch:
+        _managed = managed_lib_guids()
+        if isinstance(patch["lib_sources"], dict):
+            for _g, _ids in patch["lib_sources"].items():
+                if _g in _managed and isinstance(_ids, list):
+                    config.set_lib_sources(_g, _ids)
+        patch.pop("lib_sources", None)
+    if "lib_keywords" in patch:
+        _managed = managed_lib_guids()
+        if isinstance(patch["lib_keywords"], dict):
+            for _g, _v in patch["lib_keywords"].items():
+                if _g in _managed and isinstance(_v, dict):
+                    config.set_lib_keywords(_g, _v.get("include"), _v.get("exclude"))
+        patch.pop("lib_keywords", None)
     if "hot_library_title" in patch:
         patch["hot_library_title"] = str(patch["hot_library_title"]).strip()[:20] or HOT_DEFAULT_TITLE
     if "hot_limit" in patch:
