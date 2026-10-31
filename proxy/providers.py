@@ -357,3 +357,26 @@ def detail_source(source: dict, vod_id: str) -> OnlineTitle | None:
     """同步取详情（带缓存由调用方做）。"""
     import requests  # 仅 PoC；主代理内用 httpx 异步版
     return None
+
+
+def source_priority(source: dict, overrides: dict | None = None) -> int:
+    """源质量优先级（2026-10-31 补丁，v0.2.39-lite 缺失此函数导致聚合排序与状态接口崩溃）。
+    语义与 config.set_source_priority 一致：id -> 整数权重，越高越优先，钳制在 -100..100。
+    未在 overrides 里列出的源，取源自身 priority/weight/score 字段（内省默认），都没有则取 0，
+    排序时再按直链数降序（调用方 _group_key 的第二键）。
+    插件升级会覆盖本文件，届时若上游已补此函数则以官方版本为准。
+    """
+    sid = source.get("id") if isinstance(source, dict) else None
+    if overrides and sid in overrides:
+        try:
+            return max(-100, min(100, int(overrides[sid])))
+        except (TypeError, ValueError):
+            pass
+    if isinstance(source, dict):
+        for key in ("priority", "weight", "score"):
+            if key in source:
+                try:
+                    return max(-100, min(100, int(source[key])))
+                except (TypeError, ValueError):
+                    continue
+    return 0

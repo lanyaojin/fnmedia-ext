@@ -15,9 +15,11 @@ _STATE = Path(__file__).resolve().parent.parent / "state" / "config.json"
 _LOCK = threading.RLock()
 
 # 噪音关键词：标题或备注命中则不注入（电影解说、预告、花絮、AI 漫剧等）
+# 复刻定制：加“短剧”，使搜索结果里不再出现短剧（海量库分类聚合本身已排除短剧子类）。
 JUNK_KEYWORDS = [
     "电影解说", "影视解说", "解说", "预告片", "预告", "花絮", "抢先", "枪版",
     "AI漫剧", "漫剧", "动态漫画", "彩蛋", "删减", "片场", "开机", "特辑",
+    "短剧",
 ]
 
 DEFAULTS = {
@@ -45,6 +47,13 @@ DEFAULTS = {
     "hot_library_enabled": True,
     # 虚拟“海量分类”四库媒体库（苹果 CMS 分类深翻）。与热门榜单相互独立开关。
     "catalog_library_enabled": True,
+    # 复刻定制：按分类隐藏媒体库卡片（仅影响媒体库列表展示，不拦搜索，
+    # 也不删后台数据）。默认隐藏动漫：电影 / 剧集 / 综艺显示，动漫不显示。
+    # 可在管理页 /v/api/ext/config 里改（仅接受 movie / tv / anime / variety）。
+    # 注意：已有安装的 state/config.json 里没有这两个键时取此处默认值；
+    # 若以后在管理页保存过，则以保存的值为准。
+    "hidden_catalog_categories": ["anime"],
+    "hidden_chart_categories": ["anime"],
     # 是否把每个启用的 TVBox 加固源（csp_*Guard，如比特/糯米/花花）生成为一张
     # 独立“专区媒体库”卡片。默认关闭：加固源只作为播放时可切换的线路/搜索源，
     # 不在媒体库列表里产生空库。需要专区墙时可在管理页打开。

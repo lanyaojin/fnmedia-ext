@@ -153,6 +153,26 @@ def catalog_enabled() -> bool:
     return bool(config.get().get("catalog_library_enabled", True))
 
 
+# 复刻定制：按分类隐藏媒体库卡片。仅接受四类 id，其余值一律忽略，
+# 避免拼写错误把整个库藏空。隐藏只影响媒体库列表展示，不拦搜索。
+_KNOWN_LIB_CATS = {"movie", "tv", "anime", "variety"}
+
+
+def _hidden_categories(key: str) -> set[str]:
+    raw = config.get().get(key, [])
+    if not isinstance(raw, list):
+        return set()
+    return {c for c in raw if c in _KNOWN_LIB_CATS}
+
+
+def hidden_catalog_categories() -> set[str]:
+    return _hidden_categories("hidden_catalog_categories")
+
+
+def hidden_chart_categories() -> set[str]:
+    return _hidden_categories("hidden_chart_categories")
+
+
 def any_virtual_lib_enabled() -> bool:
     if charts_enabled() or catalog_enabled():
         return True
@@ -1224,6 +1244,8 @@ async def mediadb_list(request: Request):
         # 1) 豆瓣真实榜单四库（独立开关 hot_library_enabled）
         if charts_enabled():
             for cat, _t, _c in chartmod.CHART_CATEGORIES:
+                if cat in hidden_chart_categories():
+                    continue
                 ps = []
                 for it in chart_cache.items(cat):
                     p = inj._poster(it.get("cover") or "")
@@ -1245,6 +1267,8 @@ async def mediadb_list(request: Request):
         # 海量四库独立开关 catalog_library_enabled
         if catalog_enabled() and any(catalog.available(c) for c, _, _ in catalogmod.CATALOG_CATEGORIES):
             for cat, _t, _c in catalogmod.CATALOG_CATEGORIES:
+                if cat in hidden_catalog_categories():
+                    continue
                 if not catalog.available(cat):
                     continue
                 ps = [inj._poster(p) for p in catalog.cached_page_posters(cat, 8)]
@@ -1435,12 +1459,16 @@ async def mediadb_sum(request: Request):
     total_added = 0
     if charts_enabled():
         for cat, _t, _c in chartmod.CHART_CATEGORIES:
+            if cat in hidden_chart_categories():
+                continue
             n = len(chart_cache.items(cat))
             if n:
                 payload["data"][CHART_LIB_GUIDS[cat]] = n
                 total_added += n
     if catalog_enabled():
         for cat, _t, _c in catalogmod.CATALOG_CATEGORIES:
+            if cat in hidden_catalog_categories():
+                continue
             if catalog.available(cat):
                 n = catalog.total(cat)
                 if n:
@@ -3574,6 +3602,24 @@ def _friendly_line(key: str) -> str:
     return f"{pcn}·{stem}" if stem else pcn
 
 
+
+def _pan_match(url: str):
+    """网盘链接识别（2026-10-31 补丁，v0.2.39-lite 缺失此函数导致 preset 崩溃）。
+    lite 版无网盘源，CMS 直链一律返回 None；仅对常见网盘域名返回带 name 的 dict，
+    供 _line_display_name / _brief_line_flags / preset 排序使用（调用方只用 .get("name") 与真值判断）。
+    插件升级会覆盖本文件，届时若上游已补此函数则以官方版本为准。
+    """
+    if not url:
+        return None
+    low = str(url).lower()
+    for dom, name in (("pan.quark.cn", "夸克网盘"), ("quark.cn", "夸克网盘"),
+                      ("aliyundrive.com", "阿里网盘"), ("alipan.com", "阿里网盘"),
+                      ("pan.baidu.com", "百度网盘"), ("drive.uc.cn", "UC网盘"),
+                      ("cloud.189.cn", "天翼网盘")):
+        if dom in low:
+            return {"name": name, "url": url}
+    return None
+
 def _line_display_name(t: dict) -> str:
     """播放器线路菜单显示名：网盘线路加 ☁网盘名 前缀，便于区分高质量网盘资源。
 
@@ -4039,10 +4085,12 @@ def _virtual_lib_list() -> list[dict]:
     for cat, title, _c in chartmod.CHART_CATEGORIES:
         out.append({"guid": CHART_LIB_GUIDS[cat], "title": title,
                     "group": "hot", "enabled": charts_enabled(),
+                    "hidden": cat in hidden_chart_categories(),
                     "count": len(chart_cache.items(cat))})
     for cat, title, _c in catalogmod.CATALOG_CATEGORIES:
         out.append({"guid": CATALOG_LIB_GUIDS[cat], "title": title,
                     "group": "catalog", "enabled": catalog_enabled() and catalog.available(cat),
+                    "hidden": cat in hidden_catalog_categories(),
                     "count": catalog.total(cat) if catalog.available(cat) else 0})
     pinned = config.pinned_lib_guids()
     for d in out:
@@ -4105,12 +4153,23 @@ async def ext_set_config(request: Request):
         "hot_library_enabled", "hot_library_title", "hot_limit",
         "hot_per_source", "hot_pages_per_source", "hot_refresh_interval",
         "catalog_library_enabled",
+        "hidden_catalog_categories", "hidden_chart_categories",
         "prefer_quality_source",
         "line_fastest", "line_fastest_max", "line_fastest_timeout",
         "line_fastest_prefer", "line_autofail",
         "update_proxy",
     }
     patch = {k: v for k, v in body.items() if k in allowed}
+    # 复刻定制：隐藏分类只接受四类 id，非法值丢弃、去重保序，避免拼错藏空整个库。
+    for _hk in ("hidden_catalog_categories", "hidden_chart_categories"):
+        if _hk in patch:
+            _seen: set[str] = set()
+            _clean = []
+            for _c in patch[_hk] if isinstance(patch[_hk], list) else []:
+                if _c in _KNOWN_LIB_CATS and _c not in _seen:
+                    _seen.add(_c)
+                    _clean.append(_c)
+            patch[_hk] = _clean
     if "hot_library_title" in patch:
         patch["hot_library_title"] = str(patch["hot_library_title"]).strip()[:20] or HOT_DEFAULT_TITLE
     if "hot_limit" in patch:
