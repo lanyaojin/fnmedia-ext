@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""TVBox / 影视仓 / OK影视 配置解析（只取标准苹果CMS 源）。
+"""TVBox 配置解析：苹果 CMS 与远程 T4，不在本进程运行爬虫。
 
 这三家（及大量换皮 App）共用同一套配置结构：一个 JSON，核心是 sites[]，
 每个站点含 key/name/type/api。我们只导入其中能被本插件直接使用的：
 
 - type 1（JSON）且 api 指向苹果CMS provide/vod 的站点；
 - type 0（XML）的苹果CMS站点（接口地址在播放链路上可被识别）。
+- type 4 的远程 T4 服务（含网盘，依赖由 T4 服务端承担）。
 
 明确不支持、直接跳过：
 - type 3 Spider（csp_*，依赖 Android jar/JS 爬虫运行时）；
-- 网盘（夸克/阿里/115/百度/UC 等）、嗅探解析、直播/电台源；
+- 本地网盘运行时、嗅探解析、直播/电台源；
 - 加密且无法解出 JSON 的强混淆订阅。
 
 支持的容器形态：单 JSON、base64 包裹、{"sites":[...]}、
@@ -17,10 +18,12 @@
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import json
 import re
+from pathlib import Path
 from urllib.parse import urljoin
 
 import httpx
@@ -51,6 +54,13 @@ FONGMI_FANTAIYING = {
         "https://gh-proxy.com/https://raw.githubusercontent.com/yoursmile66/TVBox/main/XC.json",
         "https://ghproxy.net/https://raw.githubusercontent.com/yoursmile66/TVBox/main/XC.json",
         "https://cdn.jsdelivr.net/gh/yoursmile66/TVBox@main/XC.json",
+        # 作者官方备用站 http://www.饭太硬.net/tv —— 返回“图种”（JPEG 后追加
+        # 前缀**base64(配置)），fetch_text 已能剥离图片自动解码。GitHub 直连不通时
+        # 用它兜底（用 punycode 主机名，避免请求库对中文域名处理不一致）。
+        "http://www.xn--sss604efuw.net/tv",
+        "https://www.xn--sss604efuw.net/tv",
+        # 备用站导航页给出的国内直链镜像（同为图片伪装配置）
+        "https://cdn09022024.gitlink.org.cn/api/v1/repos/xxooo/in/raw/in.bmp",
     ],
 }
 
@@ -125,6 +135,82 @@ def _json_loads_dict(text: str) -> dict | None:
         except Exception:
             continue
     return None
+
+
+def _coerce_site_value(v: str):
+    """XML 属性都是字符串，按 TVBox 配置语义还原常见标量类型。"""
+    if v is None:
+        return ""
+    s = v.strip()
+    if s in ("0", "1") and len(s) == 1:
+        return int(s)
+    low = s.lower()
+    if low in ("true",):
+        return 1
+    if low in ("false",):
+        return 0
+    return s
+
+
+def parse_xml_config(text: str) -> dict | None:
+    """解析 TVBox/影视仓 XML 订阅为与 JSON 配置等价的 dict。
+
+    兼容两种常见形态：
+      1. <sites><site key=.. type=.. api=.. searchable=.. /></sites>
+      2. <config><sites>...</sites><rules>...</rules></config>
+    site 元素的属性映射为站点字段；布尔/数值属性还原为 int。仅做结构转换，
+    后续仍走与 JSON 完全相同的 classify_subscription 分类与导入流程。"""
+    if not text:
+        return None
+    stripped = text.lstrip()
+    if not stripped.startswith("<"):
+        return None
+    try:
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(stripped)
+    except Exception:
+        return None
+
+    def site_elem_to_dict(elem) -> dict:
+        site = {k: _coerce_site_value(v) for k, v in elem.attrib.items()}
+        # 元素内文本型子节点（个别 XML 用 <api>..</api> 而非属性）
+        for child in elem:
+            tag = (child.tag or "").strip().lower()
+            if tag and tag not in site and (child.text or "").strip():
+                site[tag] = child.text.strip()
+        return site
+
+    # 任意层级找 site 元素（根即 site、或包在 sites/config 里都兼容）
+    site_elems = [e for e in root.iter() if (e.tag or "").lower() == "site"]
+    if not site_elems:
+        return None
+    sites = [site_elem_to_dict(e) for e in site_elems]
+
+    cfg: dict = {"sites": sites}
+    # 全局 spider（jar）：根或 config 节点的 spider 属性
+    spider = root.attrib.get("spider")
+    if not spider:
+        for e in root.iter():
+            if (e.tag or "").lower() in ("config", "tvbox", "configuration") \
+                    and e.attrib.get("spider"):
+                spider = e.attrib["spider"]
+                break
+    if spider:
+        cfg["spider"] = spider
+    # 直播/解析等附属 URL（若 XML 提供则保留，缺失也不影响站点导入）
+    for xml_key, json_key in (("lives", "lives"), ("parses", "parses"),
+                              ("flags", "flags"), ("rules", "rules")):
+        node = next((e for e in root.iter() if (e.tag or "").lower() == xml_key), None)
+        if node is not None:
+            children = list(node)
+            if children:
+                cfg[json_key] = [
+                    {k: _coerce_site_value(v) for k, v in c.attrib.items()}
+                    or (c.text.strip() if c.text else "")
+                    for c in children]
+            elif (node.text or "").strip():
+                cfg[json_key] = node.text.strip()
+    return cfg
 
 
 # 伪装成图片（.bmp/.jpg）的订阅：图片字节之后追加 base64 配置。
@@ -231,6 +317,12 @@ def parse_config_text(text: str) -> dict | None:
     cfg = _json_loads_dict(text)
     if cfg is not None:
         return cfg
+    # XML 订阅（<sites><site .../></sites>）：在 base64/加密尝试之前先识别，
+    # 避免被误判为未知格式，转换为与 JSON 等价的 {sites:[...]} 后走同一导入流程。
+    if text.lstrip().startswith("<"):
+        xml_cfg = parse_xml_config(text)
+        if xml_cfg:
+            return xml_cfg
     decoded = _b64_try(text)
     if decoded:
         cfg = _json_loads_dict(decoded)
@@ -260,6 +352,19 @@ def classify_site(site: dict) -> tuple[str, dict | None]:
     searchable = site.get("searchable", 1)
     if not api or not api.startswith(("http://", "https://")):
         return "skip", None
+    if t == "4":
+        import t4
+        return "add_t4", {
+            "name": name or site.get("key") or "T4",
+            "api": api, "kind": "t4", "site_key": str(site.get("key") or ""),
+            "ext": site.get("ext"),
+            "enabled": t4.switch(site.get("enabled")),
+            "searchable": t4.switch(searchable),
+            "filterable": t4.switch(site.get("filterable"), False),
+            "indexs": t4.switch(site.get("indexs")),
+            "method": "POST" if str(site.get("method", "")).upper() == "POST" else "GET",
+            "raw_type": t,
+        }
     low = api.lower()
     if t == "3" or api.startswith(_SPIDER_PREFIX) or "csp_" in low:
         return "skip", None
@@ -341,7 +446,7 @@ async def fetch_text(client: httpx.AsyncClient, url: str) -> str:
 
 async def load_remote(url: str) -> tuple[list[dict], int]:
     """拉取订阅（含多订阅聚合），返回 (sites, 子订阅数)。"""
-    sites, sub, _spider = await load_subscription(url=url)
+    sites, sub, _spider, _base = await load_subscription(url=url)
     return sites, sub
 
 
@@ -437,6 +542,8 @@ def classify_subscription(sites: list[dict], spider: str = "",
     guard: list[dict] = []
     csp: list[dict] = []
     drpy: list[dict] = []
+    t4_sites: list[dict] = []
+    seen_t4: set[str] = set()
     skipped: list[dict] = []
     seen_cms: set[str] = set()
     seen_guard: set[str] = set()
@@ -459,6 +566,17 @@ def classify_subscription(sites: list[dict], spider: str = "",
         name = str(s.get("name") or s.get("key") or s.get("api") or "").strip()
         api = str(s.get("api") or "").strip()
         t = str(s.get("type", 1))
+        if t == "4":
+            _status, normalized = classify_site(s)
+            if not normalized:
+                _skip(name, "T4 接口地址非 http(s)")
+                continue
+            import t4
+            identity = t4.source_id(normalized["api"], normalized.get("ext"))
+            if identity not in seen_t4:
+                seen_t4.add(identity)
+                t4_sites.append(normalized)
+            continue
 
         # 1) 加固爬虫 csp_*Guard
         if is_guard_site(s):
@@ -550,7 +668,7 @@ def classify_subscription(sites: list[dict], spider: str = "",
         norm["transport"] = "json" if status == "add_json" else "xml"
         cms.append(norm)
 
-    return {"cms": cms, "guard": guard, "csp": csp, "drpy": drpy,
+    return {"cms": cms, "t4": t4_sites, "guard": guard, "csp": csp, "drpy": drpy,
             "skipped": skipped, "jar_url": jar_url}
 
 
@@ -587,6 +705,8 @@ async def load_subscription_full(url: str | None = None,
         sub_jar = _spider_jar_url(sub_spider, sub_base)
         for st in extract_sites(cfg):
             if isinstance(st, dict):
+                if str(st.get("type")) == "4" and sub_base and st.get("api"):
+                    st["api"] = urljoin(sub_base, str(st.get("api") or ""))
                 if sub_jar and not st.get("_spider_jar"):
                     st["_spider_jar"] = sub_jar
                 # 站点自带 jar（饭太硬部分源用伪装成 PNG 的独立 jar），优先级高于全局。
@@ -630,4 +750,24 @@ async def load_fantaiying():
         except Exception as exc:  # noqa: BLE001
             last = exc
     raise RuntimeError(f"内置饭太硬订阅所有镜像均不可达：{last}")
+
+
+# 内置「轻量猫源」：随包的纯苹果CMS(type=1)订阅，无 jar/爬虫/网盘，零运行时。
+# 与饭太硬（重爬虫、依赖安卓运行时）互补，低配机器/lite 包也能直接用。
+_CAT_LITE_FILE = Path(__file__).resolve().parent / "assets" / "cat_lite.json"
+
+
+def load_cat_lite_sync() -> tuple[list, str, str, str]:
+    """同步读取随包轻量猫源配置。返回 (sites, spider, base, used)。"""
+    cfg = json.loads(_CAT_LITE_FILE.read_text(encoding="utf-8"))
+    sites = [s for s in (cfg.get("sites") or []) if isinstance(s, dict)]
+    return sites, str(cfg.get("spider") or ""), "", "builtin:cat_lite"
+
+
+async def load_cat_lite():
+    """加载内置「轻量猫源」（本地文件，不走网络，不依赖任何运行时）。
+
+    返回 (sites, spider, base, used_url)。
+    """
+    return await asyncio.to_thread(load_cat_lite_sync)
 
